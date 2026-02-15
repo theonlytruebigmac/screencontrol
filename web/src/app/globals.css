@@ -1,0 +1,366 @@
+@import "tailwindcss";
+
+:root {
+  /* ScreenConnect red accent */
+  --sc-primary: #e05246;
+  --sc-primary-dark: #c43d32;
+  --sc-primary-light: #f06b60;
+  --sc-accent: #22d3ee;
+  --sc-success: #10b981;
+  --sc-warning: #f59e0b;
+  --sc-danger: #ef4444;
+
+  /* Surface colors */
+  --sc-surface: #1e1e1e;
+  --sc-surface-light: #2a2a2a;
+  --sc-surface-dark: #141414;
+  --sc-border: #333333;
+  --sc-border-light: #3f3f3f;
+
+  /* Panel sizing */
+  --sidebar-width: 56px;
+  --groups-width: 240px;
+  --detail-width: 360px;
+}
+
+body {
+  background: #1a1a1a;
+  color: #e0e0e0;
+  font-size: 13px;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #4b5563;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #6b7280;
+}
+
+/* ─── Glass effect ────────────────────────────────── */
+.glass {
+  background: rgba(30, 30, 30, 0.85);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--sc-border);
+}
+
+/* ─── Glow effects ────────────────────────────────── */
+.glow-primary {
+  box-shadow: 0 0 20px rgba(224, 82, 70, 0.15);
+}
+
+.glow-accent {
+  box-shadow: 0 0 20px rgba(34, 211, 238, 0.15);
+}
+
+.glow-success {
+  box-shadow: 0 0 20px rgba(16, 185, 129, 0.15);
+}
+
+/* ─── Gradient text ───────────────────────────────── */
+.gradient-text {
+  background: linear-gradient(135deg, #e05246, #f06b60);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ─── Status bar (ScreenConnect-style) ────────────── */
+.status-bar {
+  height: 12px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: #2a2a2a;
+}
+
+.status-bar-fill-online {
+  background: linear-gradient(90deg, #22a045, #3fba5c);
+  height: 100%;
+  border-radius: 2px;
+}
+
+.status-bar-fill-idle {
+  background: linear-gradient(90deg, #888, #aaa);
+  height: 100%;
+  border-radius: 2px;
+}
+
+.status-bar-fill-busy {
+  background: linear-gradient(90deg, #d04030, #e05246);
+  height: 100%;
+  border-radius: 2px;
+}
+
+/* ─── Pulse animation for online status ───────────── */
+@keyframes pulse-dot {
+
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.5;
+    transform: scale(1.5);
+  }
+}
+
+.pulse-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+/* ─── Card hover effect ───────────────────────────── */
+.card-hover {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+/* ─── ScreenConnect machine row ───────────────────── */
+.machine-row {
+  border-bottom: 1px solid var(--sc-border);
+  cursor: pointer;
+  transition: background-color 0.1s ease;
+}
+
+.machine-row:hover {
+  background-color: rgba(255, 255, 255, 0.03);
+}
+
+.machine-row.selected {
+  background-color: rgba(224, 82, 70, 0.08);
+}
+
+/* ─── Session group item ──────────────────────────── */
+.group-item {
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-left: 3px solid transparent;
+  transition: all 0.1s ease;
+}
+
+.group-item:hover {
+  background-color: rgba(255, 255, 255, 0.03);
+}
+
+.group-item.active {
+  background-color: rgba(224, 82, 70, 0.08);
+  border-left-color: var(--sc-primary);
+  color: white;
+}
+
+/* ─── Panel borders ───────────────────────────────── */
+.panel-border-r {
+  border-right: 1px solid var(--sc-border);
+}
+
+.panel-border-l {
+  border-left: 1px solid var(--sc-border);
+}
+
+/* ─── Skeleton / shimmer loading ──────────────────── */
+@keyframes shimmer {
+  0% {
+    background-position: -400px 0;
+  }
+
+  100% {
+    background-position: 400px 0;
+  }
+}
+
+.skeleton {
+  background: linear-gradient(90deg, #252525 25%, #333 50%, #252525 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: 4px;
+}
+
+/* ─── Fade-in animation ──────────────────────────── */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in {
+  animation: fade-in 0.3s ease-out;
+}
+
+/* ─── Focus ring utility ─────────────────────────── */
+.focus-ring:focus-visible {
+  outline: 2px solid var(--sc-primary);
+  outline-offset: 2px;
+}
+
+/* ─── Dot connector line ─────────────────────────── */
+.connector-line::before {
+  content: "";
+  position: absolute;
+  left: 7px;
+  top: 14px;
+  bottom: -14px;
+  width: 1px;
+  background: var(--sc-border);
+}
+
+/* ─── Badge / pill ────────────────────────────────── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 500;
+  border-radius: 100px;
+  line-height: 1.6;
+}
+
+.badge-success {
+  background: rgba(16, 185, 129, 0.12);
+  color: #34d399;
+}
+
+.badge-danger {
+  background: rgba(239, 68, 68, 0.12);
+  color: #f87171;
+}
+
+.badge-warning {
+  background: rgba(245, 158, 11, 0.12);
+  color: #fbbf24;
+}
+
+.badge-info {
+  background: rgba(34, 211, 238, 0.12);
+  color: #67e8f9;
+}
+
+/* ─── Fade in animation ──────────────────────────── */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.2s ease-out;
+}
+
+/* ─── Slide up animation (modals / panels) ────────── */
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.slide-up {
+  animation: slideUp 0.25s ease-out;
+}
+
+/* ─── Sidebar tooltip ────────────────────────────── */
+.sidebar-tooltip {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  background: #252525;
+  border: 1px solid #444;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: #e0e0e0;
+  white-space: nowrap;
+  z-index: 100;
+  pointer-events: none;
+  animation: fadeIn 0.15s ease-out;
+}
+
+.sidebar-tooltip::before {
+  content: "";
+  position: absolute;
+  left: -4px;
+  top: 50%;
+  transform: translateY(-50%) rotate(45deg);
+  width: 6px;
+  height: 6px;
+  background: #252525;
+  border-left: 1px solid #444;
+  border-bottom: 1px solid #444;
+}
+
+/* ─── Stat card interaction ──────────────────────── */
+.stat-card {
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.stat-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  border-color: #444;
+}
+
+/* ─── Page enter transition ──────────────────────── */
+@keyframes pageEnter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.page-enter {
+  animation: pageEnter 0.2s ease-out;
+}
+
+/* ─── Responsive sidebar ─────────────────────────── */
+@media (max-width: 768px) {
+  aside {
+    width: 48px !important;
+  }
+
+  aside span.leading-none {
+    display: none;
+  }
+}

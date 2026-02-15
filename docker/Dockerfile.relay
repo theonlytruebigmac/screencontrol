@@ -1,0 +1,55 @@
+# ─── Relay Dockerfile ──────────────────────────────────────────
+# Multi-stage build for the ScreenControl relay server.
+
+FROM rust:1.93-bookworm AS builder
+
+WORKDIR /build
+
+# Copy workspace manifests for dependency caching
+COPY server/Cargo.toml server/Cargo.lock* ./server/
+COPY server/crates/sc-server/Cargo.toml ./server/crates/sc-server/
+COPY server/crates/sc-relay/Cargo.toml ./server/crates/sc-relay/
+COPY server/crates/sc-agent/Cargo.toml ./server/crates/sc-agent/
+COPY server/crates/sc-protocol/Cargo.toml ./server/crates/sc-protocol/
+COPY server/crates/sc-common/Cargo.toml ./server/crates/sc-common/
+
+# Create dummy source files for dependency pre-build
+RUN mkdir -p server/crates/sc-server/src && echo "fn main(){}" > server/crates/sc-server/src/main.rs && \
+    mkdir -p server/crates/sc-relay/src && echo "fn main(){}" > server/crates/sc-relay/src/main.rs && \
+    mkdir -p server/crates/sc-agent/src && echo "fn main(){}" > server/crates/sc-agent/src/main.rs && \
+    mkdir -p server/crates/sc-protocol/src && echo "" > server/crates/sc-protocol/src/lib.rs && \
+    mkdir -p server/crates/sc-common/src && echo "" > server/crates/sc-common/src/lib.rs
+
+# Install protobuf compiler
+RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
+
+# Copy proto files (needed for build.rs)
+COPY proto/ ./proto/
+COPY server/crates/sc-protocol/build.rs ./server/crates/sc-protocol/build.rs
+
+# Pre-build dependencies
+WORKDIR /build/server
+RUN cargo build --release --bin sc-relay 2>/dev/null || true
+
+# Copy actual source
+COPY server/ ./
+COPY proto/ /build/proto/
+
+# Force rebuild: remove stub binaries and touch real source files
+RUN rm -f target/release/sc-relay target/release/deps/sc_relay* && \
+    touch crates/sc-relay/src/main.rs crates/sc-common/src/lib.rs crates/sc-protocol/src/lib.rs
+
+# Build for real
+RUN cargo build --release --bin sc-relay
+
+# ─── Runtime ──────────────────────────────────────────────────
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/server/target/release/sc-relay /usr/local/bin/sc-relay
+
+EXPOSE 8041
+
+CMD ["sc-relay"]

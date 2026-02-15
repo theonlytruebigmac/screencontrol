@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sc-server",
+    "crates/sc-relay",
+    "crates/sc-agent",
+    "crates/sc-protocol",
+    "crates/sc-common",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/screencontrol/screencontrol"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["ws", "macros"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.13"
+prost-types = "0.13"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json"] }
+
+# Redis
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# Auth
+jsonwebtoken = "9"
+argon2 = "0.5"
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
+
+# WebRTC
+webrtc = "0.12"
+
+# QUIC
+quinn = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+
+# Crypto
+rand = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Config
+dotenvy = "0.15"
+config = "0.14"
+
+# HTTP client (for agent)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# System info
+sysinfo = "0.32"
+
+# Terminal
+portable-pty = "0.8"
+
+# S3/MinIO
+aws-sdk-s3 = "1"
+aws-config = "1"
+
+# Protobuf codegen
+prost-build = "0.13"
+
+# Internal crates
+sc-protocol = { path = "crates/sc-protocol" }
+sc-common = { path = "crates/sc-common" }

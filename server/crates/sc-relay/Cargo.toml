@@ -1,0 +1,26 @@
+[package]
+name = "sc-relay"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sc-relay"
+path = "src/main.rs"
+
+[dependencies]
+sc-protocol = { workspace = true }
+sc-common = { workspace = true }
+
+tokio = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+redis = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+anyhow = { workspace = true }
+uuid = { workspace = true }
+bytes = "1"
+dashmap = "6"
+dotenvy = { workspace = true }
