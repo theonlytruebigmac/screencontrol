@@ -874,6 +874,7 @@ fn capture_display_to_jpeg(output_path: &str) -> anyhow::Result<()> {
     type CGImageDestinationRef = *const c_void;
     type CFIndex = isize;
     type CFAllocatorRef = *const c_void;
+    type CFNumberRef = *const c_void;
     type Boolean = u8;
 
     extern "C" {
@@ -901,6 +902,26 @@ fn capture_display_to_jpeg(output_path: &str) -> anyhow::Result<()> {
             is_directory: Boolean,
         ) -> CFURLRef;
 
+        // CFNumber
+        fn CFNumberCreate(
+            alloc: CFAllocatorRef,
+            the_type: CFIndex,
+            value_ptr: *const c_void,
+        ) -> CFNumberRef;
+
+        // CFDictionary
+        fn CFDictionaryCreate(
+            alloc: CFAllocatorRef,
+            keys: *const *const c_void,
+            values: *const *const c_void,
+            num_values: CFIndex,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CFDictionaryRef;
+
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+
         // ImageIO
         fn CGImageDestinationCreateWithURL(
             url: CFURLRef,
@@ -918,6 +939,7 @@ fn capture_display_to_jpeg(output_path: &str) -> anyhow::Result<()> {
 
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
     const K_CF_URL_POSIX_PATH_STYLE: isize = 0;
+    const K_CF_NUMBER_FLOAT64_TYPE: CFIndex = 13; // kCFNumberFloat64Type
 
     unsafe {
         // Capture the main display
@@ -962,10 +984,40 @@ fn capture_display_to_jpeg(output_path: &str) -> anyhow::Result<()> {
             anyhow::bail!("Failed to create image destination");
         }
 
-        CGImageDestinationAddImage(dest, image, ptr::null());
+        // Build properties dictionary with JPEG compression quality = 0.4
+        // kCGImageDestinationLossyCompressionQuality CFString key
+        let quality_key_str = "kCGImageDestinationLossyCompressionQuality";
+        let quality_key = CFStringCreateWithBytes(
+            kCFAllocatorDefault,
+            quality_key_str.as_ptr(),
+            quality_key_str.len() as CFIndex,
+            K_CF_STRING_ENCODING_UTF8,
+            0,
+        );
+        let quality_value: f64 = 0.4;
+        let quality_num = CFNumberCreate(
+            kCFAllocatorDefault,
+            K_CF_NUMBER_FLOAT64_TYPE,
+            &quality_value as *const f64 as *const c_void,
+        );
+        let keys = [quality_key as *const c_void];
+        let values = [quality_num as *const c_void];
+        let props = CFDictionaryCreate(
+            kCFAllocatorDefault,
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            &kCFTypeDictionaryKeyCallBacks as *const c_void,
+            &kCFTypeDictionaryValueCallBacks as *const c_void,
+        );
+
+        CGImageDestinationAddImage(dest, image, props);
         let ok = CGImageDestinationFinalize(dest);
 
         // Clean up
+        CFRelease(props);
+        CFRelease(quality_num);
+        CFRelease(quality_key);
         CFRelease(dest);
         CGImageRelease(image);
         CFRelease(path_cf);

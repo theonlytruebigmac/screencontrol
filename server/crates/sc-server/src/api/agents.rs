@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, patch, post, put},
@@ -25,6 +25,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{id}", get(get_agent).patch(update_agent))
         .route("/{id}/thumbnail", get(get_agent_thumbnail))
         .route("/{id}/thumbnail/upload", put(upload_agent_thumbnail))
+        .route_layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB for thumbnail uploads
         .route("/{id}/chat", get(get_agent_chat))
         .with_state(state)
 }
