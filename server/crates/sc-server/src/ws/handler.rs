@@ -256,33 +256,23 @@ async fn handle_console_socket(socket: WebSocket, session_id: Uuid, state: Arc<A
         .await;
 
     // Trigger an immediate thumbnail capture when someone connects.
-    // Look up the agent from the session binding and send a HeartbeatAck
-    // with a fresh pre-signed URL.
+    // Send a HeartbeatAck with the HTTP upload path (agent resolves against its server URL).
     if let Some(binding) = state.registry.sessions.get(&session_id) {
         let agent_id = binding.agent_id;
-        let key = format!("thumbnails/{}.jpg", agent_id);
-        if let Ok(url) = crate::services::s3::presigned_upload_url(
-            &state.s3_public,
-            &state.config.s3.bucket,
-            &key,
-            120,
-        )
-        .await
-        {
-            state.registry.mark_thumbnail_sent(&agent_id);
-            let ack = Envelope {
-                id: Uuid::new_v4().to_string(),
-                session_id: String::new(),
-                timestamp: None,
-                payload: Some(envelope::Payload::HeartbeatAck(HeartbeatAck {
-                    interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
-                    thumbnail_upload_url: url,
-                })),
-            };
-            let mut buf = Vec::new();
-            if ack.encode(&mut buf).is_ok() {
-                state.registry.send_to_agent(&agent_id, buf);
-            }
+        let upload_path = format!("/api/agents/{}/thumbnail/upload", agent_id);
+        state.registry.mark_thumbnail_sent(&agent_id);
+        let ack = Envelope {
+            id: Uuid::new_v4().to_string(),
+            session_id: String::new(),
+            timestamp: None,
+            payload: Some(envelope::Payload::HeartbeatAck(HeartbeatAck {
+                interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
+                thumbnail_upload_url: upload_path,
+            })),
+        };
+        let mut buf = Vec::new();
+        if ack.encode(&mut buf).is_ok() {
+            state.registry.send_to_agent(&agent_id, buf);
         }
     }
 
@@ -742,18 +732,11 @@ async fn handle_heartbeat(
             },
         );
 
-        // Generate a pre-signed upload URL for the agent's desktop thumbnail,
+        // Generate an HTTP upload path for the agent's desktop thumbnail,
         // but only once per hour to avoid excessive screenshot captures.
+        // The agent resolves this against its known server URL.
         let thumbnail_url = if state.registry.should_capture_thumbnail(&agent_id, 3600) {
-            let key = format!("thumbnails/{}.jpg", agent_id);
-            crate::services::s3::presigned_upload_url(
-                &state.s3_public,
-                &state.config.s3.bucket,
-                &key,
-                120,
-            )
-            .await
-            .unwrap_or_default()
+            format!("/api/agents/{}/thumbnail/upload", agent_id)
         } else {
             String::new()
         };

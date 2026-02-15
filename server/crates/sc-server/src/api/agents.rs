@@ -3,8 +3,11 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    routing::{get, patch, post},
+    http::{header, StatusCode},
+    response::IntoResponse,
+    routing::{get, patch, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -21,6 +24,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/register", post(register_agent))
         .route("/{id}", get(get_agent).patch(update_agent))
         .route("/{id}/thumbnail", get(get_agent_thumbnail))
+        .route("/{id}/thumbnail/upload", put(upload_agent_thumbnail))
         .route("/{id}/chat", get(get_agent_chat))
         .with_state(state)
 }
@@ -248,22 +252,58 @@ async fn update_agent(
     Ok(Json(AgentResponse::from_row(row, &state.registry)))
 }
 
-/// GET /agents/{id}/thumbnail — returns a pre-signed URL for the agent's desktop preview
+/// GET /agents/{id}/thumbnail — serve the desktop thumbnail image directly
 async fn get_agent_thumbnail(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     _user: AuthUser,
-) -> AppResult<Json<serde_json::Value>> {
-    let key = format!("thumbnails/{}.jpg", id);
-    let url = crate::services::s3::presigned_download_url_public(
-        &state.s3_public,
-        &state.config.s3.bucket,
-        &key,
-        300,
-    )
-    .await?;
+) -> Result<impl IntoResponse, AppError> {
+    let path = thumbnail_path(&id);
+    match tokio::fs::read(&path).await {
+        Ok(data) => Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "public, max-age=60"),
+            ],
+            data,
+        )
+            .into_response()),
+        Err(_) => Err(AppError::NotFound("No thumbnail available".into())),
+    }
+}
 
-    Ok(Json(serde_json::json!({ "url": url })))
+/// PUT /agents/{id}/thumbnail/upload — accept a JPEG screenshot and save to disk.
+///
+/// The agent calls this endpoint directly (no S3 required).
+async fn upload_agent_thumbnail(
+    State(_state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    body: Bytes,
+) -> Result<StatusCode, AppError> {
+    if body.is_empty() {
+        return Err(AppError::BadRequest("Empty body".into()));
+    }
+    let dir = thumbnail_dir();
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+        AppError::Internal(anyhow::anyhow!("Failed to create thumbnail dir: {}", e))
+    })?;
+    let path = thumbnail_path(&id);
+    tokio::fs::write(&path, &body)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to write thumbnail: {}", e)))?;
+    tracing::info!(agent_id = %id, bytes = body.len(), "Thumbnail saved");
+    Ok(StatusCode::OK)
+}
+
+/// Directory for locally-stored agent thumbnails.
+fn thumbnail_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/tmp/sc-thumbnails")
+}
+
+/// Full path for an agent's thumbnail file.
+fn thumbnail_path(agent_id: &Uuid) -> std::path::PathBuf {
+    thumbnail_dir().join(format!("{}.jpg", agent_id))
 }
 
 // ─── Chat ────────────────────────────────────────────────────

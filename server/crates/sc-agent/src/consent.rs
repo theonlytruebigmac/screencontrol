@@ -131,6 +131,25 @@ fn show_dialog_macos(
     session_type: &str,
     timeout_secs: u64,
 ) -> Result<bool, String> {
+    // When running as a service (LaunchDaemon or LaunchAgent), we cannot
+    // reliably show GUI dialogs. Auto-grant for unattended service mode.
+    // Detection: ppid == 1 means launched by launchd, uid == 0 means root,
+    // or SC_UNATTENDED=1 is set explicitly.
+    extern "C" {
+        fn getuid() -> u32;
+        fn getppid() -> u32;
+    }
+    let uid = unsafe { getuid() };
+    let ppid = unsafe { getppid() };
+    let unattended_env = std::env::var("SC_UNATTENDED").unwrap_or_default() == "1";
+
+    if uid == 0 || ppid == 1 || unattended_env {
+        return Err(format!(
+            "Running as service (uid={}, ppid={}, unattended={}) — auto-granting",
+            uid, ppid, unattended_env
+        ));
+    }
+
     let script = format!(
         r#"display dialog "{requester} is requesting {session_type} access to this computer.\n\nDo you want to allow this connection?" \
         buttons {{"Deny", "Allow"}} default button "Deny" cancel button "Deny" \

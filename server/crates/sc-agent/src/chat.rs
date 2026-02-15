@@ -6,16 +6,25 @@
 //!
 //! ## Architecture
 //!
+//! **Interactive mode** (run from terminal):
 //! ```text
 //! Main Thread (GUI):  tao event loop → wry WebView
 //!                          ↕ channels
 //! Background Thread:  tokio runtime → WebSocket → connection.rs
 //! ```
 //!
-//! The connection loop sends messages via `ChatHandle::show_message()`.
-//! User replies are forwarded back via the reply channel.
+//! **Daemon mode** (LaunchDaemon — no GUI session):
+//! ```text
+//! Daemon Process:  writes messages → /tmp/screencontrol-chat-inbox.jsonl
+//!                  reads replies  ← /tmp/screencontrol-chat-outbox.jsonl
+//!                  spawns →  sc-agent show-chat  (in user's GUI session)
+//! Helper Process:  tao event loop → wry WebView
+//!                  reads messages ← inbox file
+//!                  writes replies → outbox file
+//! ```
 
-use std::sync::mpsc;
+use std::io::Write;
+use std::sync::{mpsc, Arc, Mutex};
 #[cfg(target_os = "linux")]
 use tao::platform::unix::WindowExtUnix;
 use tao::{
@@ -26,6 +35,10 @@ use tao::{
 use wry::WebViewBuilder;
 #[cfg(target_os = "linux")]
 use wry::WebViewBuilderExtUnix;
+
+// ── IPC file paths for daemon mode ───────────────────────────
+const CHAT_INBOX: &str = "/tmp/screencontrol-chat-inbox.jsonl";
+const CHAT_OUTBOX: &str = "/tmp/screencontrol-chat-outbox.jsonl";
 
 // ── Public types ──────────────────────────────────────────────
 
@@ -51,21 +64,63 @@ pub enum ChatEvent {
     WebViewReady,
 }
 
+/// Internal backend for ChatHandle
+#[derive(Clone)]
+enum ChatBackend {
+    /// Interactive mode: sends events directly to the tao event loop
+    WebView(EventLoopProxy<ChatEvent>),
+    /// Daemon mode: writes messages to IPC file and spawns helper process
+    Daemon { helper_spawned: Arc<Mutex<bool>> },
+}
+
 /// Clonable handle used by the connection loop to interact with the chat window.
 #[derive(Clone)]
 pub struct ChatHandle {
-    proxy: EventLoopProxy<ChatEvent>,
+    backend: ChatBackend,
 }
 
 impl ChatHandle {
     pub fn show_message(&self, sender: String, content: String) {
-        let _ = self
-            .proxy
-            .send_event(ChatEvent::ShowMessage(IncomingMessage { sender, content }));
+        match &self.backend {
+            ChatBackend::WebView(proxy) => {
+                let _ =
+                    proxy.send_event(ChatEvent::ShowMessage(IncomingMessage { sender, content }));
+            }
+            ChatBackend::Daemon { helper_spawned } => {
+                // Write message to the IPC inbox file
+                let escaped_sender = sender.replace('\\', "\\\\").replace('"', "\\\"");
+                let escaped_content = content
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "");
+                let line = format!(
+                    "{{\"sender\":\"{}\",\"content\":\"{}\"}}\n",
+                    escaped_sender, escaped_content
+                );
+
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(CHAT_INBOX)
+                {
+                    let _ = f.write_all(line.as_bytes());
+                    let _ = f.flush();
+                    tracing::info!("Wrote chat message to IPC inbox");
+                }
+
+                // Spawn the chat helper in the user's GUI session (once)
+                let mut spawned = helper_spawned.lock().unwrap();
+                if !*spawned {
+                    *spawned = true;
+                    spawn_chat_helper();
+                }
+            }
+        }
     }
 }
 
-/// Create the event loop, chat handle, and reply receiver.
+/// Create the event loop, chat handle, and reply receiver for **interactive mode**.
 ///
 /// Returns:
 /// - `EventLoop<ChatEvent>` — must be run on the main thread
@@ -83,8 +138,288 @@ pub fn create() -> (
     // Store reply_tx in a static so the IPC handler can access it
     REPLY_TX.lock().unwrap().replace(reply_tx);
 
-    let handle = ChatHandle { proxy };
+    let handle = ChatHandle {
+        backend: ChatBackend::WebView(proxy),
+    };
     (event_loop, handle, reply_rx)
+}
+
+/// Create a chat handle and reply receiver for **daemon mode** (no GUI).
+///
+/// Messages are written to an IPC file and a helper process is spawned
+/// in the logged-in user's GUI session to display the chat WebView.
+pub fn create_daemon() -> (ChatHandle, mpsc::Receiver<OutgoingReply>) {
+    // Clean up stale IPC files from previous runs
+    let _ = std::fs::remove_file(CHAT_INBOX);
+    let _ = std::fs::remove_file(CHAT_OUTBOX);
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+
+    // Background thread: watch the outbox file for replies from the helper
+    std::thread::spawn(move || {
+        let mut last_len: usize = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if let Ok(contents) = std::fs::read_to_string(CHAT_OUTBOX) {
+                if contents.len() > last_len {
+                    let new_part = &contents[last_len..];
+                    for line in new_part.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        // Parse: {"content":"..."}
+                        if let Some(start) = line.find("\"content\":\"") {
+                            let rest = &line[start + 11..];
+                            if let Some(end) = rest.rfind('"') {
+                                let content = rest[..end]
+                                    .replace("\\n", "\n")
+                                    .replace("\\\"", "\"")
+                                    .replace("\\\\", "\\");
+                                let _ = reply_tx.send(OutgoingReply { content });
+                            }
+                        }
+                    }
+                    last_len = contents.len();
+                }
+            }
+        }
+    });
+
+    let handle = ChatHandle {
+        backend: ChatBackend::Daemon {
+            helper_spawned: Arc::new(Mutex::new(false)),
+        },
+    };
+
+    (handle, reply_rx)
+}
+
+/// Spawn the chat helper process in the logged-in user's GUI session.
+fn spawn_chat_helper() {
+    #[cfg(target_os = "macos")]
+    {
+        // Find the ScreenControl.app bundle binary
+        let app_exe =
+            "/Library/Application Support/ScreenControl/ScreenControl.app/Contents/MacOS/sc-agent";
+
+        // Get the console (logged-in) user's UID
+        let uid = std::process::Command::new("id")
+            .args(["-u"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u32>().ok());
+
+        // Try to get the GUI user (may differ from root)
+        let gui_uid = std::process::Command::new("stat")
+            .args(["-f", "%u", "/dev/console"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u32>().ok());
+
+        let target_uid = gui_uid.or(uid).unwrap_or(501); // fallback to typical first user
+
+        // Use launchctl asuser to run in the user's GUI session
+        let result = std::process::Command::new("launchctl")
+            .args(["asuser", &target_uid.to_string(), app_exe, "show-chat"])
+            .spawn();
+
+        match result {
+            Ok(_) => tracing::info!("Spawned chat helper for user {}", target_uid),
+            Err(e) => {
+                tracing::warn!("Failed to spawn chat helper via launchctl: {}", e);
+                // Fallback: try running directly via `open`
+                let _ = std::process::Command::new("launchctl")
+                    .args([
+                        "asuser",
+                        &target_uid.to_string(),
+                        "open",
+                        "/Library/Application Support/ScreenControl/ScreenControl.app",
+                        "--args",
+                        "show-chat",
+                    ])
+                    .spawn();
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        tracing::warn!("Daemon-mode chat helper not implemented for this platform");
+    }
+}
+
+/// Run the chat helper process (spawned by the daemon).
+///
+/// This watches the IPC inbox file for messages and displays them in a WebView.
+/// Replies are written to the outbox file for the daemon to read.
+pub fn run_chat_helper() -> ! {
+    // Create the tao event loop and WebView
+    let event_loop = EventLoopBuilder::<ChatEvent>::with_user_event().build();
+    let ready_proxy = event_loop.create_proxy();
+    let msg_proxy = event_loop.create_proxy();
+
+    // Background thread: watch inbox file for new messages
+    std::thread::spawn(move || {
+        let mut last_len: usize = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if let Ok(contents) = std::fs::read_to_string(CHAT_INBOX) {
+                if contents.len() > last_len {
+                    let new_part = &contents[last_len..];
+                    for line in new_part.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        // Parse: {"sender":"...","content":"..."}
+                        let sender = extract_json_field(line, "sender")
+                            .unwrap_or_else(|| "Support".to_string());
+                        let content = extract_json_field(line, "content").unwrap_or_default();
+                        let _ = msg_proxy.send_event(ChatEvent::ShowMessage(IncomingMessage {
+                            sender,
+                            content,
+                        }));
+                    }
+                    last_len = contents.len();
+                }
+            }
+        }
+    });
+
+    let mut webview: Option<wry::WebView> = None;
+    let mut window: Option<tao::window::Window> = None;
+    let mut webview_ready = false;
+    let mut pending_messages: Vec<IncomingMessage> = Vec::new();
+
+    event_loop.run(move |event, event_loop, control_flow| {
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::UserEvent(ChatEvent::ShowMessage(msg)) => {
+                // Ensure window + webview exist
+                if window.is_none() {
+                    let win = WindowBuilder::new()
+                        .with_title("ScreenControl — Support Chat")
+                        .with_inner_size(tao::dpi::LogicalSize::new(420.0, 520.0))
+                        .with_min_inner_size(tao::dpi::LogicalSize::new(340.0, 400.0))
+                        .with_always_on_top(false)
+                        .build(event_loop)
+                        .expect("failed to build chat window");
+
+                    let ready_proxy = ready_proxy.clone();
+
+                    let builder = WebViewBuilder::new()
+                        .with_html(CHAT_HTML)
+                        .with_ipc_handler(move |ipc_msg| {
+                            if let Ok(data) =
+                                serde_json::from_str::<serde_json::Value>(ipc_msg.body())
+                            {
+                                if data.get("type").and_then(|v| v.as_str()) == Some("ready") {
+                                    let _ = ready_proxy.send_event(ChatEvent::WebViewReady);
+                                    return;
+                                }
+                                // User reply → write to outbox file
+                                if let Some(content) = data.get("content").and_then(|v| v.as_str())
+                                {
+                                    let escaped = content
+                                        .replace('\\', "\\\\")
+                                        .replace('"', "\\\"")
+                                        .replace('\n', "\\n");
+                                    let line = format!("{{\"content\":\"{}\"}}\n", escaped);
+                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(CHAT_OUTBOX)
+                                    {
+                                        let _ = f.write_all(line.as_bytes());
+                                        let _ = f.flush();
+                                    }
+                                }
+                            }
+                        })
+                        .with_transparent(false);
+
+                    #[cfg(target_os = "linux")]
+                    let wv = {
+                        let vbox = win.default_vbox().expect("failed to get GTK vbox");
+                        builder.build_gtk(vbox).expect("failed to build webview")
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let wv = builder.build(&win).expect("failed to build webview");
+
+                    webview = Some(wv);
+                    window = Some(win);
+                    webview_ready = false;
+                }
+
+                // Bring window to front
+                if let Some(ref w) = window {
+                    w.set_visible(true);
+                    w.set_focus();
+                }
+
+                if webview_ready {
+                    if let Some(ref wv) = webview {
+                        let js = inject_message_js(&msg);
+                        let _ = wv.evaluate_script(&js);
+                    }
+                } else {
+                    pending_messages.push(msg);
+                }
+            }
+
+            Event::UserEvent(ChatEvent::WebViewReady) => {
+                webview_ready = true;
+                if let Some(ref wv) = webview {
+                    for msg in pending_messages.drain(..) {
+                        let js = inject_message_js(&msg);
+                        let _ = wv.evaluate_script(&js);
+                    }
+                }
+            }
+
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                // Clean up IPC files and exit
+                let _ = std::fs::remove_file(CHAT_INBOX);
+                let _ = std::fs::remove_file(CHAT_OUTBOX);
+                std::process::exit(0);
+            }
+
+            _ => {}
+        }
+    })
+}
+
+/// Extract a JSON string field value from a simple JSON line.
+/// Handles basic escape sequences. Does NOT use a full JSON parser.
+fn extract_json_field(json: &str, field: &str) -> Option<String> {
+    let pattern = format!("\"{}\":\"", field);
+    let start = json.find(&pattern)? + pattern.len();
+    let rest = &json[start..];
+    // Find the closing unescaped quote
+    let mut end = 0;
+    let bytes = rest.as_bytes();
+    while end < bytes.len() {
+        if bytes[end] == b'"' && (end == 0 || bytes[end - 1] != b'\\') {
+            break;
+        }
+        end += 1;
+    }
+    if end >= bytes.len() {
+        return None;
+    }
+    let raw = &rest[..end];
+    Some(
+        raw.replace("\\n", "\n")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\"),
+    )
 }
 
 /// Escape a string for safe embedding in a JS single-quoted string literal.
@@ -218,7 +553,6 @@ pub fn run_event_loop(event_loop: EventLoop<ChatEvent>) -> ! {
 
 // ── Reply channel (shared via mutex for IPC handler) ─────────
 
-use std::sync::Mutex;
 static REPLY_TX: Mutex<Option<mpsc::Sender<OutgoingReply>>> = Mutex::new(None);
 
 // ── Embedded HTML/CSS/JS ─────────────────────────────────────

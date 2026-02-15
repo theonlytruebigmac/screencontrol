@@ -116,6 +116,41 @@ pub async fn check_and_apply(server_base_url: &str) -> anyhow::Result<bool> {
     let current_exe = std::env::current_exe()?;
     replace_binary(&current_exe, &new_binary).await?;
 
+    // On macOS, re-sign the .app bundle so TCC permissions persist.
+    // The binary lives inside ScreenControl.app/Contents/MacOS/sc-agent,
+    // so we walk up from the binary to find the .app directory.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(macos_dir) = current_exe.parent() {
+            if let Some(contents_dir) = macos_dir.parent() {
+                if let Some(app_dir) = contents_dir.parent() {
+                    if app_dir.extension().and_then(|e| e.to_str()) == Some("app") {
+                        let label = "com.screencontrol.agent";
+                        let sign_result = std::process::Command::new("codesign")
+                            .args([
+                                "--force",
+                                "--deep",
+                                "--sign",
+                                "-",
+                                "--identifier",
+                                label,
+                                app_dir.to_str().unwrap_or_default(),
+                            ])
+                            .status();
+                        match sign_result {
+                            Ok(s) if s.success() => {
+                                tracing::info!("Re-signed .app bundle after update");
+                            }
+                            _ => {
+                                tracing::warn!("Failed to re-sign .app bundle — TCC may re-prompt");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     tracing::info!(
         "Update applied: v{} → v{}. Restarting...",
         current_version,

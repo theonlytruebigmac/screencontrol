@@ -587,7 +587,7 @@ mod linux {
     }
 }
 
-// ─── macOS: ScreenCaptureKit (Phase B) ─────────────────────────────
+// ─── macOS: CoreGraphics capture ────────────────────────────────────
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -595,173 +595,343 @@ mod macos {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use image::codecs::jpeg::JpegEncoder;
-    use image::ColorType;
+    use image::ImageEncoder;
     use prost::Message as ProstMessage;
     use tokio::sync::mpsc;
     use uuid::Uuid;
-
-    use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
-    use screencapturekit::prelude::*;
 
     use sc_protocol::{envelope, DesktopFrame, Envelope};
 
     const DEFAULT_FPS: u32 = 15;
     const DEFAULT_QUALITY: u8 = 60;
 
+    // CoreGraphics FFI bindings
+    type CGDirectDisplayID = u32;
+    type CGImageRef = *const std::ffi::c_void;
+    type CGColorSpaceRef = *const std::ffi::c_void;
+    type CGContextRef = *mut std::ffi::c_void;
+
+    type CGEventRef = *const std::ffi::c_void;
+    type CGEventSourceRef = *const std::ffi::c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGMainDisplayID() -> CGDirectDisplayID;
+        fn CGDisplayPixelsWide(display: CGDirectDisplayID) -> usize;
+        fn CGDisplayPixelsHigh(display: CGDirectDisplayID) -> usize;
+        fn CGDisplayCreateImage(display: CGDirectDisplayID) -> CGImageRef;
+        fn CGImageGetWidth(image: CGImageRef) -> usize;
+        fn CGImageGetHeight(image: CGImageRef) -> usize;
+        fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
+        fn CGColorSpaceRelease(space: CGColorSpaceRef);
+        fn CGImageRelease(image: CGImageRef);
+        fn CGBitmapContextCreate(
+            data: *mut u8,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: CGColorSpaceRef,
+            bitmap_info: u32,
+        ) -> CGContextRef;
+        fn CGContextDrawImage(ctx: CGContextRef, rect: CGRect, image: CGImageRef);
+        fn CGContextRelease(ctx: CGContextRef);
+        fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
+        fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+        fn CFRelease(cf: *const std::ffi::c_void);
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        #[allow(dead_code)]
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
+
+    // kCGImageAlphaNoneSkipLast = RGBX (RGB with padding byte, no alpha)
+    const BITMAP_INFO_RGBX: u32 = 5; // kCGImageAlphaNoneSkipLast
+
+    /// Get current mouse cursor position in logical (point) coordinates
+    fn get_mouse_position() -> (f64, f64) {
+        unsafe {
+            let event = CGEventCreate(std::ptr::null());
+            if event.is_null() {
+                return (0.0, 0.0);
+            }
+            let point = CGEventGetLocation(event);
+            CFRelease(event);
+            (point.x, point.y)
+        }
+    }
+
+    /// Draw a simple arrow cursor onto RGBX pixel data at the given pixel coordinates.
+    /// `scale` controls pixel size (e.g. 2 for Retina) so the cursor is visible.
+    fn draw_cursor(
+        pixel_data: &mut [u8],
+        img_width: usize,
+        img_height: usize,
+        cx: usize,
+        cy: usize,
+        scale: usize,
+    ) {
+        // Standard arrow cursor shape (11x19 logical pixels)
+        // 1 = white fill, 2 = black outline, 0 = transparent
+        const CURSOR: &[&[u8]] = &[
+            &[2],
+            &[2, 2],
+            &[2, 1, 2],
+            &[2, 1, 1, 2],
+            &[2, 1, 1, 1, 2],
+            &[2, 1, 1, 1, 1, 2],
+            &[2, 1, 1, 1, 1, 1, 2],
+            &[2, 1, 1, 1, 1, 1, 1, 2],
+            &[2, 1, 1, 1, 1, 1, 1, 1, 2],
+            &[2, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+            &[2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+            &[2, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2],
+            &[2, 1, 1, 1, 2, 1, 1, 2],
+            &[2, 1, 1, 2, 0, 2, 1, 1, 2],
+            &[2, 1, 2, 0, 0, 2, 1, 1, 2],
+            &[2, 2, 0, 0, 0, 0, 2, 1, 1, 2],
+            &[2, 0, 0, 0, 0, 0, 2, 1, 1, 2],
+            &[0, 0, 0, 0, 0, 0, 0, 2, 1, 2],
+            &[0, 0, 0, 0, 0, 0, 0, 2, 2],
+        ];
+
+        let s = scale.max(1);
+        let bytes_per_row = img_width * 4;
+        for (dy, row) in CURSOR.iter().enumerate() {
+            for (dx, &pixel) in row.iter().enumerate() {
+                if pixel == 0 {
+                    continue;
+                }
+                let (r, g, b) = if pixel == 1 {
+                    (255u8, 255u8, 255u8)
+                } else {
+                    (0u8, 0u8, 0u8)
+                };
+                // Fill a scale×scale block for each cursor pixel
+                for sy in 0..s {
+                    let py = cy + dy * s + sy;
+                    if py >= img_height {
+                        break;
+                    }
+                    for sx in 0..s {
+                        let px = cx + dx * s + sx;
+                        if px >= img_width {
+                            break;
+                        }
+                        let base = py * bytes_per_row + px * 4;
+                        if base + 2 < pixel_data.len() {
+                            pixel_data[base] = r;
+                            pixel_data[base + 1] = g;
+                            pixel_data[base + 2] = b;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Capture a single frame from the display and return raw RGBX pixel data with cursor
+    fn capture_display_frame(display_id: CGDirectDisplayID) -> Option<(Vec<u8>, u32, u32)> {
+        unsafe {
+            let cg_image = CGDisplayCreateImage(display_id);
+            if cg_image.is_null() {
+                return None;
+            }
+
+            let width = CGImageGetWidth(cg_image);
+            let height = CGImageGetHeight(cg_image);
+            if width == 0 || height == 0 {
+                CGImageRelease(cg_image);
+                return None;
+            }
+
+            let bytes_per_row = width * 4;
+            let mut pixel_data: Vec<u8> = vec![0u8; bytes_per_row * height];
+
+            let color_space = CGColorSpaceCreateDeviceRGB();
+            let context = CGBitmapContextCreate(
+                pixel_data.as_mut_ptr(),
+                width,
+                height,
+                8, // bits per component
+                bytes_per_row,
+                color_space,
+                BITMAP_INFO_RGBX,
+            );
+
+            if context.is_null() {
+                CGColorSpaceRelease(color_space);
+                CGImageRelease(cg_image);
+                return None;
+            }
+
+            let rect = CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: width as f64,
+                    height: height as f64,
+                },
+            };
+
+            CGContextDrawImage(context, rect, cg_image);
+            CGContextRelease(context);
+            CGColorSpaceRelease(color_space);
+            CGImageRelease(cg_image);
+
+            // Draw cursor overlay
+            let (mx, my) = get_mouse_position();
+            // Scale from logical points to pixel coordinates (Retina)
+            let logical_w = CGDisplayPixelsWide(display_id) as f64;
+            let scale_f = if logical_w > 0.0 {
+                width as f64 / logical_w
+            } else {
+                2.0
+            };
+            let scale = scale_f.round() as usize;
+            let cursor_x = (mx * scale_f) as usize;
+            let cursor_y = (my * scale_f) as usize;
+            draw_cursor(&mut pixel_data, width, height, cursor_x, cursor_y, scale);
+
+            Some((pixel_data, width as u32, height as u32))
+        }
+    }
+
     pub async fn capture_session(
         session_id: String,
-        monitor_index: u32,
+        _monitor_index: u32,
         ws_tx: mpsc::UnboundedSender<Vec<u8>>,
     ) {
-        tracing::info!(
-            "Starting ScreenCaptureKit capture for session {} (monitor {})",
-            session_id,
-            monitor_index
-        );
-
-        // Step 1: Get available displays
-        let content = match AsyncSCShareableContent::get().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Failed to get shareable content: {}", e);
-                return;
+        // Pre-flight TCC check — informational only, do NOT call
+        // CGRequestScreenCaptureAccess as it triggers a system dialog every time.
+        unsafe {
+            let has_access = CGPreflightScreenCaptureAccess();
+            if has_access {
+                tracing::debug!("Screen Recording permission pre-flight: granted");
+            } else {
+                tracing::warn!(
+                    "Screen Recording permission pre-flight: NOT granted. \
+                     Grant permission in System Settings > Privacy & Security > Screen Recording."
+                );
             }
-        };
-
-        let displays = content.displays();
-        if displays.is_empty() {
-            tracing::error!("No displays found");
-            return;
         }
 
-        // Select requested monitor (fall back to primary)
-        let idx = (monitor_index as usize).min(displays.len() - 1);
-        let display = &displays[idx];
-        let display_width = display.width() as u32;
-        let display_height = display.height() as u32;
+        let display_id = unsafe { CGMainDisplayID() };
+        let display_width = unsafe { CGDisplayPixelsWide(display_id) } as u32;
+        let display_height = unsafe { CGDisplayPixelsHigh(display_id) } as u32;
+
         tracing::info!(
-            width = display_width,
-            height = display_height,
-            "Capturing display"
+            "Starting CoreGraphics capture for session {} (display {}, {}x{})",
+            session_id,
+            display_id,
+            display_width,
+            display_height
         );
 
-        // Step 2: Configure capture
-        let filter = SCContentFilter::create()
-            .with_display(display)
-            .with_excluding_windows(&[])
-            .build();
-
-        let config = SCStreamConfiguration::new()
-            .with_width(display_width)
-            .with_height(display_height)
-            .with_pixel_format(PixelFormat::BGRA);
-
-        // Step 3: Create async stream
-        let stream = AsyncSCStream::new(
-            &filter,
-            &config,
-            DEFAULT_FPS as usize,
-            SCStreamOutputType::Screen,
-        );
-
-        if let Err(e) = stream.start_capture() {
-            tracing::error!("Failed to start ScreenCaptureKit capture: {}", e);
-            return;
-        }
-
-        tracing::info!("ScreenCaptureKit capture started");
-
+        let frame_interval = std::time::Duration::from_millis(1000 / DEFAULT_FPS as u64);
         let frame_seq = AtomicU32::new(0);
 
-        // Step 4: Read frames in a loop
         loop {
             if ws_tx.is_closed() {
                 tracing::info!("WS channel closed, stopping macOS capture");
                 break;
             }
 
-            match stream.next().await {
-                Some(sample) => {
-                    // Extract pixel buffer from CMSampleBuffer
-                    let pixel_buffer = match sample.image_buffer() {
-                        Some(pb) => pb,
-                        None => continue,
-                    };
+            // Capture a frame using CoreGraphics (blocking FFI, run on blocking thread)
+            let frame_result =
+                tokio::task::spawn_blocking(move || capture_display_frame(display_id)).await;
 
-                    let width = pixel_buffer.width() as u32;
-                    let height = pixel_buffer.height() as u32;
-
-                    if width == 0 || height == 0 {
-                        continue;
-                    }
-
-                    // Lock and get raw BGRA pixel data
-                    let bgra_data = match pixel_buffer.data() {
-                        Some(data) => data.to_vec(),
-                        None => continue,
-                    };
-
-                    // Convert BGRA → RGB for JPEG encoding
-                    let pixel_count = (width * height) as usize;
-                    let mut rgb_data = Vec::with_capacity(pixel_count * 3);
-                    for i in 0..pixel_count {
-                        let base = i * 4;
-                        if base + 2 < bgra_data.len() {
-                            rgb_data.push(bgra_data[base + 2]); // R
-                            rgb_data.push(bgra_data[base + 1]); // G
-                            rgb_data.push(bgra_data[base]); // B
-                        }
-                    }
-
-                    // Encode to JPEG
-                    let mut jpeg_buf = Cursor::new(Vec::new());
-                    let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, DEFAULT_QUALITY);
-                    if encoder
-                        .write_image(&rgb_data, width, height, ColorType::Rgb8.into())
-                        .is_err()
-                    {
-                        continue;
-                    }
-
-                    let jpeg_data = jpeg_buf.into_inner();
-                    let seq = frame_seq.fetch_add(1, Ordering::Relaxed);
-
-                    let envelope = Envelope {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: session_id.clone(),
-                        timestamp: None,
-                        payload: Some(envelope::Payload::DesktopFrame(DesktopFrame {
-                            width,
-                            height,
-                            data: jpeg_data,
-                            sequence: seq,
-                            quality: DEFAULT_QUALITY as u32,
-                        })),
-                    };
-
-                    let mut buf = Vec::new();
-                    if envelope.encode(&mut buf).is_ok() {
-                        if ws_tx.send(buf).is_err() {
-                            tracing::info!("WS channel closed, stopping capture");
-                            break;
-                        }
-                        if seq % 30 == 0 {
-                            tracing::info!(seq, width, height, "Sent desktop frame (macOS)");
-                        }
-                    }
+            let (bgra_data, width, height) = match frame_result {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    tracing::warn!("CGDisplayCreateImage returned null — no screen access?");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
                 }
-                None => {
-                    tracing::info!("ScreenCaptureKit stream ended");
+                Err(e) => {
+                    tracing::error!("Capture task panicked: {}", e);
                     break;
                 }
+            };
+
+            // Convert RGBX → RGB for JPEG encoding (drop padding byte)
+            let bytes_per_row = width as usize * 4;
+            let pixel_count = (width * height) as usize;
+            let mut rgb_data = Vec::with_capacity(pixel_count * 3);
+            for row in 0..height as usize {
+                let row_start = row * bytes_per_row;
+                for col in 0..width as usize {
+                    let base = row_start + col * 4;
+                    if base + 2 < bgra_data.len() {
+                        rgb_data.push(bgra_data[base]); // R
+                        rgb_data.push(bgra_data[base + 1]); // G
+                        rgb_data.push(bgra_data[base + 2]); // B
+                    }
+                }
             }
+
+            // Encode to JPEG
+            let mut jpeg_buf = Cursor::new(Vec::new());
+            let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, DEFAULT_QUALITY);
+            if encoder
+                .write_image(&rgb_data, width, height, image::ExtendedColorType::Rgb8)
+                .is_err()
+            {
+                tracing::warn!("JPEG encode failed for {}x{} frame", width, height);
+                tokio::time::sleep(frame_interval).await;
+                continue;
+            }
+
+            let jpeg_data = jpeg_buf.into_inner();
+            let seq = frame_seq.fetch_add(1, Ordering::Relaxed);
+
+            let envelope = Envelope {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.clone(),
+                timestamp: None,
+                payload: Some(envelope::Payload::DesktopFrame(DesktopFrame {
+                    width,
+                    height,
+                    data: jpeg_data,
+                    sequence: seq,
+                    quality: DEFAULT_QUALITY as u32,
+                })),
+            };
+
+            let mut buf = Vec::new();
+            if envelope.encode(&mut buf).is_ok() {
+                if ws_tx.send(buf).is_err() {
+                    tracing::info!("WS channel closed, stopping capture");
+                    break;
+                }
+                if seq % 30 == 0 {
+                    tracing::info!(seq, width, height, "Sent desktop frame (macOS CG)");
+                }
+            }
+
+            tokio::time::sleep(frame_interval).await;
         }
 
-        let _ = stream.stop_capture();
-        tracing::info!(
-            "ScreenCaptureKit capture stopped for session {}",
-            session_id
-        );
+        tracing::info!("CoreGraphics capture stopped for session {}", session_id);
     }
 }
 

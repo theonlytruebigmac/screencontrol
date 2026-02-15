@@ -29,6 +29,7 @@ dotenvy = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 dirs = "6"
+libc = "0.2"
 
 # Embedded WebView chat window (ScreenConnect-style)
 tao = "0.31"

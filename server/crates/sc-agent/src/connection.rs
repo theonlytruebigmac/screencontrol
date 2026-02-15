@@ -260,12 +260,17 @@ pub async fn connect_and_run(
                                     );
                                 }
 
-                                // Upload desktop thumbnail if server provided an upload URL
+                                // Upload desktop thumbnail if server provided an upload URL/path
                                 if !ack.thumbnail_upload_url.is_empty() {
-                                    let url = ack.thumbnail_upload_url.clone();
+                                    // Server may send a relative path like /api/agents/{id}/thumbnail/upload
+                                    let url = if ack.thumbnail_upload_url.starts_with('/') {
+                                        format!("{}{}", http_base, ack.thumbnail_upload_url)
+                                    } else {
+                                        ack.thumbnail_upload_url.clone()
+                                    };
                                     tokio::spawn(async move {
                                         if let Err(e) = capture_and_upload_thumbnail(&url).await {
-                                            tracing::debug!("Thumbnail upload skipped: {}", e);
+                                            tracing::warn!("Thumbnail upload skipped: {}", e);
                                         }
                                     });
                                 }
@@ -827,22 +832,154 @@ async fn capture_and_upload_thumbnail(upload_url: &str) -> anyhow::Result<()> {
 
 /// Capture a desktop screenshot on macOS and upload it to the pre-signed S3 URL.
 ///
-/// Uses the built-in `screencapture` command-line tool.
+/// Uses CoreGraphics `CGDisplayCreateImage` directly via FFI, which works
+/// from a root LaunchDaemon when Screen Recording TCC permission is granted.
+/// Falls back to `screencapture` in interactive (non-root) mode.
 #[cfg(target_os = "macos")]
 async fn capture_and_upload_thumbnail(upload_url: &str) -> anyhow::Result<()> {
     let tmp_path = "/tmp/sc_thumbnail.jpg";
 
-    // -x = no sound, -t jpg = JPEG format
-    let output = tokio::process::Command::new("screencapture")
-        .args(["-x", "-t", "jpg", tmp_path])
-        .output()
-        .await?;
+    // Clean up any previous thumbnail
+    let _ = tokio::fs::remove_file(tmp_path).await;
 
-    if !output.status.success() {
-        anyhow::bail!("screencapture failed: {:?}", output.stderr);
+    // Use CoreGraphics to capture the main display directly.
+    // This works as root when Screen Recording TCC is granted.
+    let _captured = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        capture_display_to_jpeg(tmp_path)
+    })
+    .await??;
+
+    // Verify the file exists and is non-empty
+    match tokio::fs::metadata(tmp_path).await {
+        Ok(meta) if meta.len() > 0 => {}
+        _ => anyhow::bail!("Screenshot capture produced no output file"),
     }
 
     upload_thumbnail_file(tmp_path, upload_url).await
+}
+
+/// Use CoreGraphics to capture the main display and save as JPEG.
+#[cfg(target_os = "macos")]
+fn capture_display_to_jpeg(output_path: &str) -> anyhow::Result<()> {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    // CoreGraphics / CoreFoundation / ImageIO type aliases
+    type CGDirectDisplayID = u32;
+    type CGImageRef = *const c_void;
+    type CFTypeRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFURLRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CGImageDestinationRef = *const c_void;
+    type CFIndex = isize;
+    type CFAllocatorRef = *const c_void;
+    type Boolean = u8;
+
+    extern "C" {
+        fn CGMainDisplayID() -> CGDirectDisplayID;
+        fn CGDisplayCreateImage(display: CGDirectDisplayID) -> CGImageRef;
+        fn CGImageRelease(image: CGImageRef);
+
+        fn CFRelease(cf: CFTypeRef);
+
+        // CFString
+        static kCFAllocatorDefault: CFAllocatorRef;
+        fn CFStringCreateWithBytes(
+            alloc: CFAllocatorRef,
+            bytes: *const u8,
+            num_bytes: CFIndex,
+            encoding: u32,
+            is_external: Boolean,
+        ) -> CFStringRef;
+
+        // CFURL
+        fn CFURLCreateWithFileSystemPath(
+            alloc: CFAllocatorRef,
+            file_path: CFStringRef,
+            path_style: isize,
+            is_directory: Boolean,
+        ) -> CFURLRef;
+
+        // ImageIO
+        fn CGImageDestinationCreateWithURL(
+            url: CFURLRef,
+            ty: CFStringRef,
+            count: usize,
+            options: CFDictionaryRef,
+        ) -> CGImageDestinationRef;
+        fn CGImageDestinationAddImage(
+            dest: CGImageDestinationRef,
+            image: CGImageRef,
+            properties: CFDictionaryRef,
+        );
+        fn CGImageDestinationFinalize(dest: CGImageDestinationRef) -> Boolean;
+    }
+
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
+    const K_CF_URL_POSIX_PATH_STYLE: isize = 0;
+
+    unsafe {
+        // Capture the main display
+        let display_id = CGMainDisplayID();
+        let image = CGDisplayCreateImage(display_id);
+        if image.is_null() {
+            anyhow::bail!("CGDisplayCreateImage returned null — Screen Recording permission may not be granted");
+        }
+
+        // Create CFURL for output path
+        let path_cf = CFStringCreateWithBytes(
+            kCFAllocatorDefault,
+            output_path.as_ptr(),
+            output_path.len() as CFIndex,
+            K_CF_STRING_ENCODING_UTF8,
+            0,
+        );
+        let url = CFURLCreateWithFileSystemPath(
+            kCFAllocatorDefault,
+            path_cf,
+            K_CF_URL_POSIX_PATH_STYLE,
+            0,
+        );
+
+        // Create "public.jpeg" UTI string
+        let jpeg_uti_str = "public.jpeg";
+        let jpeg_uti = CFStringCreateWithBytes(
+            kCFAllocatorDefault,
+            jpeg_uti_str.as_ptr(),
+            jpeg_uti_str.len() as CFIndex,
+            K_CF_STRING_ENCODING_UTF8,
+            0,
+        );
+
+        // Create image destination and write
+        let dest = CGImageDestinationCreateWithURL(url, jpeg_uti, 1, ptr::null());
+        if dest.is_null() {
+            CGImageRelease(image);
+            CFRelease(path_cf);
+            CFRelease(url);
+            CFRelease(jpeg_uti);
+            anyhow::bail!("Failed to create image destination");
+        }
+
+        CGImageDestinationAddImage(dest, image, ptr::null());
+        let ok = CGImageDestinationFinalize(dest);
+
+        // Clean up
+        CFRelease(dest);
+        CGImageRelease(image);
+        CFRelease(path_cf);
+        CFRelease(url);
+        CFRelease(jpeg_uti);
+
+        if ok == 0 {
+            anyhow::bail!("CGImageDestinationFinalize failed");
+        }
+
+        tracing::debug!("Captured display {} via CoreGraphics", display_id);
+    }
+
+    Ok(())
 }
 
 /// Capture a desktop screenshot on Windows and upload it to the pre-signed S3 URL.
@@ -909,9 +1046,9 @@ async fn upload_thumbnail_file(path: &str, upload_url: &str) -> anyhow::Result<(
         .await?;
 
     if resp.status().is_success() {
-        tracing::debug!("Thumbnail uploaded successfully");
+        tracing::info!("Thumbnail uploaded successfully");
     } else {
-        tracing::debug!("Thumbnail upload failed: HTTP {}", resp.status());
+        tracing::warn!("Thumbnail upload failed: HTTP {}", resp.status());
     }
 
     Ok(())

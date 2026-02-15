@@ -23,6 +23,7 @@ mod filebrowser;
 mod input;
 mod screen;
 mod service;
+mod setup;
 mod sysinfo_collector;
 mod terminal;
 mod updater;
@@ -46,7 +47,21 @@ fn main() -> anyhow::Result<()> {
     match subcommand {
         "install" => {
             let config = parse_install_flags(&args[2..])?;
-            return service::install(config);
+            service::install(config)?;
+            // Auto-launch setup unless --no-setup was passed
+            if !args.iter().any(|a| a == "--no-setup") {
+                println!("\nLaunching permission setup...");
+                setup::run_setup();
+            }
+            return Ok(());
+        }
+        "setup" => {
+            setup::run_setup();
+        }
+        "show-chat" => {
+            // Chat helper process — spawned by the daemon to show the WebView
+            // in the logged-in user's GUI session
+            chat::run_chat_helper();
         }
         "uninstall" => {
             return service::uninstall();
@@ -73,8 +88,18 @@ fn main() -> anyhow::Result<()> {
     // Load agent configuration
     let server_url = std::env::var("SC_SERVER_URL")
         .unwrap_or_else(|_| "ws://localhost:8080/ws/agent".to_string());
-    let tenant_token = std::env::var("SC_TENANT_TOKEN").expect("SC_TENANT_TOKEN is required");
-    let group_name = std::env::var("SC_GROUP").unwrap_or_default();
+    let tenant_token = std::env::var("SC_TENANT_TOKEN").unwrap_or_default();
+    let group_name = std::env::var("SC_GROUP").unwrap_or_else(|_| {
+        if tenant_token.is_empty() {
+            "unmanaged".to_string()
+        } else {
+            String::new()
+        }
+    });
+
+    if tenant_token.is_empty() {
+        tracing::warn!("SC_TENANT_TOKEN not set — registering into 'unmanaged' group");
+    }
 
     // Collect system information
     let sys_info = sysinfo_collector::collect_system_info();
@@ -86,32 +111,33 @@ fn main() -> anyhow::Result<()> {
         sys_info.arch
     );
 
-    // ── Create chat window infrastructure ────────────────────
-    // The GUI event loop must run on the main thread (platform requirement).
-    // Tokio async runtime runs on a background thread.
-    let (event_loop, chat_handle, reply_rx) = chat::create();
+    let unattended = std::env::var("SC_UNATTENDED").unwrap_or_default() == "1"
+        || unsafe { libc::getppid() } == 1;
 
-    // ── Spawn tokio runtime on background thread ─────────────
-    let chat_handle_clone = chat_handle.clone();
-    std::thread::spawn(move || {
+    if unattended {
+        // ── Headless / service mode — no GUI, run tokio on main thread ──
+        tracing::info!("Running in unattended (service) mode — chat via IPC helper");
+
         let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        rt.block_on(async move {
+        rt.block_on(async {
             let mut last_update_check = std::time::Instant::now()
                 .checked_sub(Duration::from_secs(updater::UPDATE_CHECK_INTERVAL_SECS))
                 .unwrap_or_else(std::time::Instant::now);
 
-            // Wrap the reply receiver for sharing across reconnection iterations
-            let reply_rx = std::sync::Arc::new(std::sync::Mutex::new(reply_rx));
-
             loop {
                 tracing::info!("Connecting to server: {}", server_url);
+
+                // Create daemon-mode chat handle (file-based IPC → spawns helper)
+                let (chat_handle, reply_rx) = chat::create_daemon();
+
+                let reply_rx = std::sync::Arc::new(std::sync::Mutex::new(reply_rx));
 
                 match connection::connect_and_run(
                     &server_url,
                     &tenant_token,
                     &group_name,
                     &sys_info,
-                    chat_handle_clone.clone(),
+                    chat_handle.clone(),
                     reply_rx.clone(),
                 )
                 .await
@@ -143,10 +169,71 @@ fn main() -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
-    });
+    } else {
+        // ── Interactive mode — chat GUI on main thread, tokio on background ──
 
-    // ── Run GUI event loop on main thread (blocks forever) ───
-    chat::run_event_loop(event_loop);
+        // The GUI event loop must run on the main thread (platform requirement).
+        // Tokio async runtime runs on a background thread.
+        let (event_loop, chat_handle, reply_rx) = chat::create();
+
+        let chat_handle_clone = chat_handle.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+            rt.block_on(async move {
+                let mut last_update_check = std::time::Instant::now()
+                    .checked_sub(Duration::from_secs(updater::UPDATE_CHECK_INTERVAL_SECS))
+                    .unwrap_or_else(std::time::Instant::now);
+
+                let reply_rx = std::sync::Arc::new(std::sync::Mutex::new(reply_rx));
+
+                loop {
+                    tracing::info!("Connecting to server: {}", server_url);
+
+                    match connection::connect_and_run(
+                        &server_url,
+                        &tenant_token,
+                        &group_name,
+                        &sys_info,
+                        chat_handle_clone.clone(),
+                        reply_rx.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!("Connection closed gracefully");
+                        }
+                        Err(e) => {
+                            tracing::error!("Connection error: {}", e);
+                        }
+                    }
+
+                    // Check for updates periodically between reconnection attempts
+                    if last_update_check.elapsed().as_secs() >= updater::UPDATE_CHECK_INTERVAL_SECS
+                    {
+                        last_update_check = std::time::Instant::now();
+                        match updater::check_and_apply(&server_url).await {
+                            Ok(true) => {
+                                tracing::info!("Update applied, exiting for service restart...");
+                                std::process::exit(0);
+                            }
+                            Ok(false) => {} // No update
+                            Err(e) => {
+                                tracing::debug!("Update check error: {}", e);
+                            }
+                        }
+                    }
+
+                    tracing::info!("Reconnecting in 5 seconds...");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            });
+        });
+
+        // Run GUI event loop on main thread (blocks forever)
+        chat::run_event_loop(event_loop);
+    }
+
+    Ok(())
 }
 
 /// Parse `--server-url`, `--token`, `--group` flags from install arguments.

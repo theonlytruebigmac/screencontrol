@@ -149,7 +149,7 @@ fn map_key_code(code: u32) -> Option<enigo::Key> {
         16 => Some(Key::Shift),
         17 => Some(Key::Control),
         18 => Some(Key::Alt),
-        19 => Some(Key::Pause),
+        19 => None, // Pause — not available in enigo 0.2
         20 => Some(Key::CapsLock),
         27 => Some(Key::Escape),
         32 => Some(Key::Space),
@@ -161,7 +161,7 @@ fn map_key_code(code: u32) -> Option<enigo::Key> {
         38 => Some(Key::UpArrow),
         39 => Some(Key::RightArrow),
         40 => Some(Key::DownArrow),
-        45 => Some(Key::Insert),
+        45 => None, // Insert — not available in enigo 0.2
         46 => Some(Key::Delete),
         91 => Some(Key::Meta), // Windows/Super key
         // Punctuation
