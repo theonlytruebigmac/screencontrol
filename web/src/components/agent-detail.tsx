@@ -312,20 +312,28 @@ export function AgentDetail({ agent }: AgentDetailProps) {
         return () => { disconnectAgentWs(); };
     }, [disconnectAgentWs]);
 
-    // Desktop thumbnail — fetch pre-signed URL on mount and periodically
+    // Desktop thumbnail — fetch JPEG blob on mount and periodically
     const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
     useEffect(() => {
         if (!agent) return;
         const fetchThumb = () => {
             const token = localStorage.getItem("sc_access_token");
             if (token) api.setToken(token);
-            api.getAgentThumbnail(agent.id)
-                .then(r => setThumbnailUrl(r.url))
+            api.getAgentThumbnailUrl(agent.id)
+                .then(blobUrl => {
+                    setThumbnailUrl(prev => {
+                        if (prev) URL.revokeObjectURL(prev);
+                        return blobUrl;
+                    });
+                })
                 .catch(() => setThumbnailUrl(null));
         };
         fetchThumb();
         const interval = setInterval(fetchThumb, 30_000);
-        return () => clearInterval(interval);
+        return () => {
+            clearInterval(interval);
+            setThumbnailUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
+        };
     }, [agent]);
 
     // Notes — persisted to server via admin_notes + localStorage fallback
@@ -603,8 +611,13 @@ export function AgentDetail({ agent }: AgentDetailProps) {
                                 onClick={() => {
                                     const token = localStorage.getItem("sc_access_token");
                                     if (token) api.setToken(token);
-                                    api.getAgentThumbnail(agent.id)
-                                        .then(r => setThumbnailUrl(r.url))
+                                    api.getAgentThumbnailUrl(agent.id)
+                                        .then(blobUrl => {
+                                            setThumbnailUrl(prev => {
+                                                if (prev) URL.revokeObjectURL(prev);
+                                                return blobUrl;
+                                            });
+                                        })
                                         .catch(() => setThumbnailUrl(null));
                                     info("Refreshing", "Desktop preview and guest info updated");
                                 }}
@@ -731,10 +744,10 @@ export function AgentDetail({ agent }: AgentDetailProps) {
                                 <div
                                     key={msg.id}
                                     className={`max-w-[85%] px-3 py-2 rounded-lg text-xs ${msg.sender === "host"
-                                            ? "ml-auto bg-[#e05246]/20 text-gray-200 rounded-br-sm"
-                                            : msg.sender === "agent-user"
-                                                ? "bg-[#1e3a5f] text-blue-200 rounded-bl-sm"
-                                                : "bg-[#252525] text-gray-400 italic rounded-bl-sm"
+                                        ? "ml-auto bg-[#e05246]/20 text-gray-200 rounded-br-sm"
+                                        : msg.sender === "agent-user"
+                                            ? "bg-[#1e3a5f] text-blue-200 rounded-bl-sm"
+                                            : "bg-[#252525] text-gray-400 italic rounded-bl-sm"
                                         }`}
                                 >
                                     {msg.sender === "agent-user" && msg.senderName && (

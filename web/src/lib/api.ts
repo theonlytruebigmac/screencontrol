@@ -286,8 +286,17 @@ class ApiClient {
         });
     }
 
-    async getAgentThumbnail(id: string) {
-        return this.request<{ url: string }>(`/agents/${id}/thumbnail`);
+    async getAgentThumbnailUrl(id: string): Promise<string> {
+        const headers: Record<string, string> = {};
+        if (this.token) {
+            headers["Authorization"] = `Bearer ${this.token}`;
+        }
+        const response = await fetch(`${this.baseUrl}/agents/${id}/thumbnail`, { headers });
+        if (!response.ok) {
+            throw new Error(`Thumbnail fetch failed: ${response.status}`);
+        }
+        const blob = await response.blob();
+        return URL.createObjectURL(blob);
     }
 
     async getAgentChat(id: string, limit = 50) {
