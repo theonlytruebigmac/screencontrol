@@ -1,9 +1,5 @@
 # ScreenControl
 
-**The open-source, self-hosted remote support platform.**
-
-![Dashboard](docs/images/home.png)
-
 ## Overview
 
 **ScreenControl** is a modern, high-performance remote desktop and fleet management solution designed for speed, security, and simplicity. Built with Rust and Next.js, it offers a lag-free experience for managing thousands of devices from a single pane of glass.
@@ -12,6 +8,8 @@ Unlike SaaS solutions (like TeamViewer or ScreenConnect) that charge per-technic
 
 
 ## Features
+
+![Dashboard](docs/images/home.png)
 
 ### 🖥️ Remote Support & Control
 Initiate remote control sessions instantly. ScreenControl supports full PTY-backed terminals, desktop streaming, and file management.
