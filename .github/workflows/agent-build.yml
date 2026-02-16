@@ -234,10 +234,10 @@ jobs:
 
       - name: Build sc-agent (${{ matrix.target }})
         env:
-          PATH: /tmp/osxcross/bin:${{ env.PATH }}
           # Tell pkg-config to not look for libs (macOS deps are in the SDK)
           PKG_CONFIG_ALLOW_CROSS: 1
         run: |
+          export PATH="/tmp/osxcross/bin:$PATH"
           cargo build --manifest-path server/Cargo.toml \
             --package sc-agent --release --target ${{ matrix.target }}
 

@@ -1836,7 +1836,7 @@ mod windows {
     use std::sync::Arc;
 
     use image::codecs::jpeg::JpegEncoder;
-    use image::ColorType;
+    use image::ExtendedColorType;
     use prost::Message as ProstMessage;
     use tokio::sync::mpsc;
     use uuid::Uuid;
@@ -2040,7 +2040,8 @@ mod windows {
 
             let width = frame.width();
             let height = frame.height();
-            let bgra_data = frame.buffer()?;
+            let frame_buffer = frame.buffer()?;
+            let bgra_data = frame_buffer.as_raw_buffer();
 
             // Lazy FFmpeg init on first frame (when we know dimensions)
             if !self.ffmpeg_attempted {
@@ -2056,7 +2057,7 @@ mod windows {
 
             // H264 path: write BGRA to FFmpeg stdin
             if let Some(ref mut enc) = self.ffmpeg {
-                if enc.stdin.write_all(&bgra_data).is_err() {
+                if enc.stdin.write_all(bgra_data).is_err() {
                     tracing::warn!("FFmpeg stdin write failed, falling back to JPEG");
                     // Drop the broken encoder, switch to JPEG
                     self.ffmpeg = None;
@@ -2082,7 +2083,7 @@ mod windows {
                 .effective_quality(DEFAULT_QUALITY as u32) as u8;
             let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, eff_quality);
             if encoder
-                .write_image(&rgb_data, width, height, ColorType::Rgb8.into())
+                .write_image(&rgb_data, width, height, ExtendedColorType::Rgb8)
                 .is_err()
             {
                 return Ok(());
