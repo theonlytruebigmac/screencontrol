@@ -7,22 +7,27 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::middleware::AuthUser;
 use crate::AppState;
 use sc_common::{AppError, AppResult};
+use sc_protocol::{envelope, CommandRequest, Envelope};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(list_agents))
         .route("/register", post(register_agent))
-        .route("/{id}", get(get_agent).patch(update_agent))
+        .route(
+            "/{id}",
+            get(get_agent).patch(update_agent).delete(delete_agent),
+        )
         .route("/{id}/thumbnail", get(get_agent_thumbnail))
         .route("/{id}/thumbnail/upload", put(upload_agent_thumbnail))
         .route_layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB for thumbnail uploads
@@ -251,6 +256,91 @@ async fn update_agent(
         .ok_or_else(|| AppError::NotFound("Agent not found".into()))?;
 
     Ok(Json(AgentResponse::from_row(row, &state.registry)))
+}
+
+// ─── Delete ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct DeleteAgentQuery {
+    #[serde(default)]
+    uninstall: bool,
+}
+
+/// DELETE /agents/{id}?uninstall=true|false
+///
+/// - uninstall=true: send `sc-agent uninstall` to the agent via WS, then delete from DB
+/// - uninstall=false: just delete from DB (agent stays installed on the machine)
+async fn delete_agent(
+    AuthUser(claims): AuthUser,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<DeleteAgentQuery>,
+) -> AppResult<StatusCode> {
+    // Verify agent exists
+    let _agent: AgentRow = sqlx::query_as("SELECT * FROM agents WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Agent not found".into()))?;
+
+    // If uninstall requested and agent is online, send uninstall command
+    if params.uninstall && state.registry.agents.contains_key(&id) {
+        tracing::info!(%id, "Sending uninstall command to agent");
+        let envelope = Envelope {
+            id: Uuid::new_v4().to_string(),
+            session_id: String::new(),
+            timestamp: None,
+            payload: Some(envelope::Payload::CommandRequest(CommandRequest {
+                command: "sc-agent".to_string(),
+                args: vec!["uninstall".to_string()],
+                working_dir: String::new(),
+                timeout_secs: 30,
+            })),
+        };
+        let mut buf = Vec::new();
+        if envelope.encode(&mut buf).is_ok() {
+            state.registry.send_to_agent(&id, buf);
+        }
+    }
+
+    // Unregister from WS registry (drops active sessions too)
+    state.registry.unregister_agent(&id);
+
+    // Delete from database (cascades to sessions, agent_groups, chat_messages)
+    sqlx::query("DELETE FROM agents WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+    // Clean up thumbnail file
+    let thumb = thumbnail_path(&id);
+    if thumb.exists() {
+        let _ = std::fs::remove_file(&thumb);
+    }
+
+    // Record audit entry
+    let user_id = Uuid::parse_str(&claims.sub).ok();
+    let _ = crate::api::audit::record(
+        &state.db,
+        user_id,
+        "agent.delete",
+        Some("agent"),
+        Some(id),
+        None,
+        Some(serde_json::json!({
+            "uninstall": params.uninstall,
+        })),
+    )
+    .await;
+
+    // Broadcast event so UI removes the agent
+    state.registry.broadcast_event(&serde_json::json!({
+        "type": "agent.deleted",
+        "agent_id": id.to_string(),
+    }));
+
+    tracing::info!(%id, uninstall = params.uninstall, "Agent deleted");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /agents/{id}/thumbnail — serve the desktop thumbnail image directly

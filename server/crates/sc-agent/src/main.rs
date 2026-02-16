@@ -48,8 +48,9 @@ fn main() -> anyhow::Result<()> {
         "install" => {
             let config = parse_install_flags(&args[2..])?;
             service::install(config)?;
-            // Auto-launch setup unless --no-setup was passed
-            if !args.iter().any(|a| a == "--no-setup") {
+            // Auto-launch setup unless --no-setup or --silent was passed
+            let silent = args.iter().any(|a| a == "--silent");
+            if !silent && !args.iter().any(|a| a == "--no-setup") {
                 println!("\nLaunching permission setup...");
                 setup::run_setup();
             }
@@ -256,6 +257,9 @@ fn parse_install_flags(args: &[String]) -> anyhow::Result<service::InstallConfig
             "--group" => {
                 i += 1;
                 group = args.get(i).cloned();
+            }
+            "--no-setup" | "--silent" => {
+                // Handled in main(), just skip here
             }
             other => {
                 anyhow::bail!("Unknown install flag: {}", other);

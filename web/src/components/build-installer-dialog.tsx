@@ -58,11 +58,12 @@ export function BuildInstallerDialog({ open, onClose }: BuildInstallerDialogProp
     );
 
     const serverUrl = typeof window !== "undefined" ? window.location.origin : "https://screencontrol.local";
+    const apiBase = `${serverUrl}/api/installer/script`;
     const deployCommand = selectedPlatform === "linux"
-        ? `curl -sL ${serverUrl}/agent/install.sh | sudo bash -s -- --name "${agentName || "agent"}" --org "${orgName}"`
+        ? `curl -sL "${apiBase}?os=linux" | sudo bash`
         : selectedPlatform === "macos"
-            ? `curl -sL ${serverUrl}/agent/install.sh | bash -s -- --name "${agentName || "agent"}" --org "${orgName}"`
-            : `powershell -c "irm ${serverUrl}/agent/install.ps1 | iex"`;
+            ? `curl -sL "${apiBase}?os=macos" | sudo bash`
+            : `powershell -NoProfile -ExecutionPolicy Bypass -Command "irm '${apiBase}?os=windows' | iex"`;
 
     const handleCopy = () => {
         navigator.clipboard.writeText(deployCommand);
@@ -172,7 +173,10 @@ export function BuildInstallerDialog({ open, onClose }: BuildInstallerDialogProp
 
                     {/* Deploy command */}
                     <div>
-                        <label className="block text-xs text-gray-500 mb-2 uppercase tracking-wider">Deploy Command</label>
+                        <label className="block text-xs text-gray-500 mb-2 uppercase tracking-wider">CLI Deploy Command</label>
+                        <p className="text-[10px] text-gray-600 mb-2">
+                            Run this on the target machine to install the agent as a service. Creates all directories, downloads the binary, and registers the system service.
+                        </p>
                         <div className="relative">
                             <pre className="bg-[#0d0d0d] border border-[#333] rounded-lg p-3 pr-10 text-xs text-gray-300 font-mono overflow-x-auto whitespace-pre-wrap break-all">
                                 {deployCommand}
@@ -188,6 +192,40 @@ export function BuildInstallerDialog({ open, onClose }: BuildInstallerDialogProp
                                     <Copy className="w-3.5 h-3.5 text-gray-400" />
                                 )}
                             </button>
+                        </div>
+                        <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-gray-600">
+                            <div className="bg-[#141414] rounded p-2 border border-[#222]">
+                                <span className="text-gray-500 font-medium">Binary:</span>{" "}
+                                {selectedPlatform === "windows"
+                                    ? "%ProgramFiles%\\ScreenControl"
+                                    : selectedPlatform === "macos"
+                                        ? "/Library/Application Support/ScreenControl"
+                                        : "/opt/screencontrol"}
+                            </div>
+                            <div className="bg-[#141414] rounded p-2 border border-[#222]">
+                                <span className="text-gray-500 font-medium">Config:</span>{" "}
+                                {selectedPlatform === "windows"
+                                    ? "%ProgramData%\\ScreenControl"
+                                    : selectedPlatform === "macos"
+                                        ? "/Library/Application Support/ScreenControl"
+                                        : "/etc/screencontrol"}
+                            </div>
+                            <div className="bg-[#141414] rounded p-2 border border-[#222]">
+                                <span className="text-gray-500 font-medium">Logs:</span>{" "}
+                                {selectedPlatform === "windows"
+                                    ? "%ProgramData%\\ScreenControl\\logs"
+                                    : selectedPlatform === "macos"
+                                        ? "/var/log/screencontrol-agent.log"
+                                        : "/var/log/screencontrol (+ journalctl)"}
+                            </div>
+                            <div className="bg-[#141414] rounded p-2 border border-[#222]">
+                                <span className="text-gray-500 font-medium">Service:</span>{" "}
+                                {selectedPlatform === "windows"
+                                    ? "LocalSystem (delayed-auto)"
+                                    : selectedPlatform === "macos"
+                                        ? "LaunchDaemon (root)"
+                                        : "systemd (root)"}
+                            </div>
                         </div>
                     </div>
                 </div>

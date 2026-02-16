@@ -17,6 +17,7 @@ import {
     Cpu,
     MemoryStick,
     Check,
+    Download,
 } from "lucide-react";
 import type { Agent } from "@/lib/api";
 import { useRouter } from "next/navigation";
@@ -431,6 +432,15 @@ export function MachineList({
                         >
                             <MessageSquare className="w-3 h-3" /> Message
                         </button>
+                        <button
+                            onClick={() => {
+                                info("Bulk Update", `Triggering update for ${checkedIds.size} agents...`);
+                                setCheckedIds(new Set());
+                            }}
+                            className="flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded transition-colors"
+                        >
+                            <Download className="w-3 h-3" /> Force Update
+                        </button>
                         <div className="flex-1" />
                         <button
                             onClick={() => {
@@ -453,7 +463,7 @@ export function MachineList({
             </div>
 
             {/* Column headers */}
-            <div className="grid grid-cols-[auto_1fr_auto_200px] items-center gap-2 px-3 py-1.5 text-[10px] text-gray-600 uppercase tracking-wider border-b border-[#333] bg-[#1a1a1a]">
+            <div className="grid grid-cols-[auto_1fr_auto_auto_200px] items-center gap-2 px-3 py-1.5 text-[10px] text-gray-600 uppercase tracking-wider border-b border-[#333] bg-[#1a1a1a]">
                 <div className="w-5 flex items-center justify-center">
                     <input
                         type="checkbox"
@@ -463,6 +473,7 @@ export function MachineList({
                     />
                 </div>
                 <span>Machine</span>
+                <span>Version</span>
                 <span>Session</span>
                 <span>Status</span>
             </div>
@@ -482,7 +493,7 @@ export function MachineList({
                             onContextMenu={(e) => handleContextMenu(e, agent)}
                             className={`machine-row ${isSelected ? "selected" : ""}`}
                         >
-                            <div className="grid grid-cols-[auto_1fr_auto_200px] items-center gap-2 px-3 py-2">
+                            <div className="grid grid-cols-[auto_1fr_auto_auto_200px] items-center gap-2 px-3 py-2">
                                 {/* Checkbox */}
                                 <div className="w-5 flex items-center justify-center">
                                     <input
@@ -514,6 +525,17 @@ export function MachineList({
                                     <div className="text-[11px] text-gray-500 truncate">
                                         {formatMetricLine(agent)}
                                     </div>
+                                </div>
+
+                                {/* Version */}
+                                <div className="flex items-center">
+                                    {agent.agent_version ? (
+                                        <span className="px-1.5 py-0.5 rounded text-[9px] font-medium bg-[#252525] border border-[#333] text-gray-400 font-mono">
+                                            v{agent.agent_version}
+                                        </span>
+                                    ) : (
+                                        <span className="text-[9px] text-gray-700">—</span>
+                                    )}
                                 </div>
 
                                 {/* Session icons */}

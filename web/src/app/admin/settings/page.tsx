@@ -27,7 +27,7 @@ import {
     Server,
 } from 'lucide-react';
 import { useToast } from '@/components/toast';
-import { api } from '@/lib/api';
+import { api, UpdatePolicy } from '@/lib/api';
 
 // ─── Toggle Component ────────────────────────────
 function Toggle({ enabled, onChange, label, description }: {
@@ -104,11 +104,25 @@ export default function SettingsPage() {
 
     const [saving, setSaving] = useState(false);
 
+    // Update Policy
+    const [updatePolicy, setUpdatePolicy] = useState<UpdatePolicy>({
+        mode: 'automatic',
+        maintenance_window_start: null,
+        maintenance_window_end: null,
+        rollout_percentage: 100,
+        auto_update_enabled: true,
+    });
+    const [policySaving, setPolicySaving] = useState(false);
+
     // Load saved settings on mount
     useEffect(() => {
         const token = getAccessToken();
         if (token) {
             api.setToken(token);
+
+            // Load update policy
+            api.getUpdatePolicy().then(p => setUpdatePolicy(p)).catch(() => { });
+
             api.getSettings('general').then(rows => {
                 for (const r of rows) {
                     const v = r.value as string;
@@ -279,6 +293,130 @@ export default function SettingsPage() {
                         enabled={requireMfa}
                         onChange={setRequireMfa}
                     />
+                </Card>
+
+                {/* Agent Updates */}
+                <Card title="Agent Updates" icon={Download}>
+                    <Toggle
+                        label="Automatic Updates"
+                        description="Push agent updates automatically via heartbeat when new versions are available"
+                        enabled={updatePolicy.auto_update_enabled}
+                        onChange={(v) => setUpdatePolicy(prev => ({ ...prev, auto_update_enabled: v }))}
+                    />
+
+                    {updatePolicy.auto_update_enabled && (
+                        <>
+                            {/* Mode selector */}
+                            <div>
+                                <label className="block text-xs text-gray-500 mb-2">Update Mode</label>
+                                <div className="flex gap-2">
+                                    {(['automatic', 'manual'] as const).map((m) => (
+                                        <button
+                                            key={m}
+                                            onClick={() => setUpdatePolicy(prev => ({ ...prev, mode: m }))}
+                                            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg border text-sm transition-all capitalize ${updatePolicy.mode === m
+                                                ? 'border-[#e05246] bg-[#e05246]/10 text-white'
+                                                : 'border-[#333] bg-[#141414] text-gray-400 hover:border-[#555] hover:text-gray-300'
+                                                }`}
+                                        >
+                                            {m === 'automatic' ? <RefreshCw className="w-3.5 h-3.5" /> : <Shield className="w-3.5 h-3.5" />}
+                                            {m}
+                                        </button>
+                                    ))}
+                                </div>
+                                <p className="text-[11px] text-gray-600 mt-1.5">
+                                    {updatePolicy.mode === 'automatic'
+                                        ? 'Updates are pushed to agents as soon as a heartbeat is received'
+                                        : 'Admin must manually trigger updates from the Agents page'}
+                                </p>
+                            </div>
+
+                            {/* Maintenance window */}
+                            <div>
+                                <label className="block text-xs text-gray-500 mb-1.5">Maintenance Window (optional)</label>
+                                <p className="text-[11px] text-gray-600 mb-2">Restrict automatic updates to a specific time window</p>
+                                <div className="flex items-center gap-2">
+                                    <input
+                                        type="time"
+                                        value={updatePolicy.maintenance_window_start || ''}
+                                        onChange={(e) => setUpdatePolicy(prev => ({
+                                            ...prev,
+                                            maintenance_window_start: e.target.value || null
+                                        }))}
+                                        placeholder="Start"
+                                        className="bg-[#141414] border border-[#333] rounded-lg px-3 py-2 text-sm text-gray-100 focus:border-[#e05246] focus:outline-none transition-colors"
+                                    />
+                                    <span className="text-xs text-gray-600">to</span>
+                                    <input
+                                        type="time"
+                                        value={updatePolicy.maintenance_window_end || ''}
+                                        onChange={(e) => setUpdatePolicy(prev => ({
+                                            ...prev,
+                                            maintenance_window_end: e.target.value || null
+                                        }))}
+                                        placeholder="End"
+                                        className="bg-[#141414] border border-[#333] rounded-lg px-3 py-2 text-sm text-gray-100 focus:border-[#e05246] focus:outline-none transition-colors"
+                                    />
+                                    {(updatePolicy.maintenance_window_start || updatePolicy.maintenance_window_end) && (
+                                        <button
+                                            onClick={() => setUpdatePolicy(prev => ({
+                                                ...prev,
+                                                maintenance_window_start: null,
+                                                maintenance_window_end: null
+                                            }))}
+                                            className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
+                                        >
+                                            Clear
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Rollout percentage */}
+                            <div>
+                                <label className="block text-xs text-gray-500 mb-1.5">
+                                    Rollout Percentage — <span className="text-gray-300">{updatePolicy.rollout_percentage}%</span>
+                                </label>
+                                <input
+                                    type="range"
+                                    min="1"
+                                    max="100"
+                                    value={updatePolicy.rollout_percentage}
+                                    onChange={(e) => setUpdatePolicy(prev => ({
+                                        ...prev,
+                                        rollout_percentage: Number(e.target.value)
+                                    }))}
+                                    className="w-full accent-[#e05246]"
+                                />
+                                <p className="text-[11px] text-gray-600 mt-0.5">
+                                    {updatePolicy.rollout_percentage === 100
+                                        ? 'All agents will receive updates simultaneously'
+                                        : `Only ${updatePolicy.rollout_percentage}% of agents will update per heartbeat cycle`}
+                                </p>
+                            </div>
+
+                            {/* Save policy */}
+                            <button
+                                onClick={async () => {
+                                    setPolicySaving(true);
+                                    try {
+                                        const token = getAccessToken();
+                                        if (token) api.setToken(token);
+                                        await api.updateUpdatePolicy(updatePolicy);
+                                        success('Policy Saved', 'Agent update policy has been updated');
+                                    } catch {
+                                        success('Error', 'Failed to save update policy');
+                                    }
+                                    setPolicySaving(false);
+                                }}
+                                disabled={policySaving}
+                                className="flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium bg-[#252525] border border-[#333] hover:bg-[#333] text-gray-300 transition-colors disabled:opacity-50"
+                            >
+                                <Save className="w-3.5 h-3.5" />
+                                {policySaving ? 'Saving...' : 'Save Update Policy'}
+                            </button>
+                        </>
+                    )}
                 </Card>
 
                 {/* Agent Enrollment */}

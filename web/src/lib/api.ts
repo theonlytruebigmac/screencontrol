@@ -336,6 +336,27 @@ class ApiClient {
     async getSystemHealth() {
         return this.request<SystemHealthResponse>("/stats/system-health");
     }
+
+    // ─── Update Policy ──────────────────────────────────────────
+
+    async getUpdatePolicy() {
+        return this.request<UpdatePolicy>("/admin/update-policy");
+    }
+
+    async updateUpdatePolicy(policy: UpdatePolicy) {
+        return this.request<UpdatePolicy>("/admin/update-policy", {
+            method: "PUT",
+            body: policy,
+        });
+    }
+
+    // ─── Agent Deletion ─────────────────────────────────────────
+
+    async deleteAgent(id: string, uninstall: boolean = false) {
+        return this.request<void>(`/agents/${id}?uninstall=${uninstall}`, {
+            method: "DELETE",
+        });
+    }
 }
 
 // ─── Types ───────────────────────────────────────────────────
@@ -495,6 +516,14 @@ export interface SystemHealthResponse {
     server: ServerInfo;
     components: ComponentHealth[];
     resources: ResourceInfo[];
+}
+
+export interface UpdatePolicy {
+    mode: string;
+    maintenance_window_start: string | null;
+    maintenance_window_end: string | null;
+    rollout_percentage: number;
+    auto_update_enabled: boolean;
 }
 
 // Singleton instance

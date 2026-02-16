@@ -275,3 +275,91 @@ fn restart_service() {
             .status();
     }
 }
+
+/// Apply an update using info provided directly by the server via HeartbeatAck.
+///
+/// This skips the HTTP update-check polling step since the server already
+/// told us the download URL and checksum. Reuses the same download/verify/
+/// replace/restart pipeline as `check_and_apply`.
+pub async fn apply_update_from_hint(
+    download_url: &str,
+    sha256: &str,
+    version: &str,
+) -> anyhow::Result<()> {
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    // Don't re-apply if we're already at this version
+    if current_version == version {
+        tracing::debug!("Already at version {} — skipping hint update", version);
+        return Ok(());
+    }
+
+    tracing::info!(
+        "Applying server-pushed update: v{} → v{}",
+        current_version,
+        version
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+
+    // Download new binary
+    let new_binary = download_binary(&client, download_url).await?;
+
+    // Verify checksum
+    if !sha256.is_empty() {
+        let actual = sha256_hex(&new_binary);
+        if actual != sha256 {
+            anyhow::bail!(
+                "Update checksum mismatch: expected {}, got {}",
+                sha256,
+                actual
+            );
+        }
+        tracing::info!("Update checksum verified: {}", actual);
+    }
+
+    // Replace current binary
+    let current_exe = std::env::current_exe()?;
+    replace_binary(&current_exe, &new_binary).await?;
+
+    // macOS re-signing
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(macos_dir) = current_exe.parent() {
+            if let Some(contents_dir) = macos_dir.parent() {
+                if let Some(app_dir) = contents_dir.parent() {
+                    if app_dir.extension().and_then(|e| e.to_str()) == Some("app") {
+                        let label = "com.screencontrol.agent";
+                        let sign_result = std::process::Command::new("codesign")
+                            .args([
+                                "--force",
+                                "--deep",
+                                "--sign",
+                                "-",
+                                "--identifier",
+                                label,
+                                app_dir.to_str().unwrap_or_default(),
+                            ])
+                            .status();
+                        if let Ok(s) = sign_result {
+                            if s.success() {
+                                tracing::info!("Re-signed .app bundle after update");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        "Update applied via heartbeat hint: v{} → v{}. Restarting...",
+        current_version,
+        version
+    );
+
+    restart_service();
+    Ok(())
+}

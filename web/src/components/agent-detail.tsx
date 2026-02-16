@@ -28,6 +28,7 @@ import {
     AlertTriangle,
     AlertCircle,
     InfoIcon,
+    ShieldAlert,
 } from "lucide-react";
 import type { Agent, Session, Script } from "@/lib/api";
 import { api } from "@/lib/api";
@@ -38,6 +39,7 @@ import { useToast } from "@/components/toast";
 
 interface AgentDetailProps {
     agent: Agent | null;
+    onDelete?: () => void;
 }
 
 function formatBytes(bytes: number): string {
@@ -108,7 +110,7 @@ interface Note {
 
 // ─── Component ───────────────────────────────────────────
 
-export function AgentDetail({ agent }: AgentDetailProps) {
+export function AgentDetail({ agent, onDelete }: AgentDetailProps) {
     const router = useRouter();
     const { info } = useToast();
     const [activeTab, setActiveTab] = useState("general");
@@ -684,8 +686,11 @@ export function AgentDetail({ agent }: AgentDetailProps) {
                         <InfoRow label="Client Version" value={`v${agent.agent_version}`} icon={<HardDrive className="w-3.5 h-3.5 text-gray-600" />} />
                         <InfoRow
                             label="Registered"
-                            value={new Date(agent.created_at).toLocaleDateString()}
+                            value={new Date(agent.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
                         />
+
+                        {/* ─── Danger Zone ──────────────────── */}
+                        <DangerZone agent={agent} onDelete={onDelete} />
                     </div>
                 )}
 
@@ -1081,3 +1086,104 @@ function TimelineEntry({
         </div>
     );
 }
+
+function DangerZone({ agent, onDelete }: { agent: Agent; onDelete?: () => void }) {
+    const [showConfirm, setShowConfirm] = useState(false);
+    const [deleteMode, setDeleteMode] = useState<"uninstall" | "remove" | null>(null);
+    const [deleting, setDeleting] = useState(false);
+    const { error } = useToast();
+
+    const handleDelete = async () => {
+        if (!deleteMode) return;
+        setDeleting(true);
+        try {
+            const token = localStorage.getItem("sc_access_token");
+            if (token) api.setToken(token);
+            await api.deleteAgent(agent.id, deleteMode === "uninstall");
+            setShowConfirm(false);
+            onDelete?.();
+        } catch (e) {
+            error("Delete failed", e instanceof Error ? e.message : "Unknown error");
+        } finally {
+            setDeleting(false);
+        }
+    };
+
+    return (
+        <>
+            <div className="mt-6 pt-4 border-t border-[#333]">
+                <p className="text-[10px] text-red-400/70 uppercase tracking-wider mb-3 flex items-center gap-1.5">
+                    <ShieldAlert className="w-3 h-3" /> Danger Zone
+                </p>
+                <div className="space-y-2">
+                    <button
+                        onClick={() => { setDeleteMode("uninstall"); setShowConfirm(true); }}
+                        disabled={agent.status === "offline"}
+                        className="w-full flex items-center gap-2 px-3 py-2.5 bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 hover:border-red-500/30 text-red-400 text-xs rounded-lg transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                    >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <div className="text-left">
+                            <p className="font-medium">Uninstall & Remove</p>
+                            <p className="text-[9px] text-red-400/60 mt-0.5">Uninstall agent from machine and delete all records</p>
+                        </div>
+                    </button>
+                    <button
+                        onClick={() => { setDeleteMode("remove"); setShowConfirm(true); }}
+                        className="w-full flex items-center gap-2 px-3 py-2.5 bg-[#252525] hover:bg-[#333] border border-[#333] hover:border-[#444] text-gray-400 text-xs rounded-lg transition-all"
+                    >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <div className="text-left">
+                            <p className="font-medium">Remove from System</p>
+                            <p className="text-[9px] text-gray-600 mt-0.5">Delete records only &mdash; agent stays installed on the machine</p>
+                        </div>
+                    </button>
+                </div>
+            </div>
+
+            {/* Confirmation overlay */}
+            {showConfirm && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                    <div className="bg-[#1e1e1e] border border-[#333] rounded-xl p-5 w-[380px] shadow-2xl">
+                        <div className="flex items-center gap-2 mb-3">
+                            <div className="p-2 rounded-lg bg-red-500/10">
+                                <AlertTriangle className="w-5 h-5 text-red-400" />
+                            </div>
+                            <div>
+                                <h3 className="text-sm font-bold text-white">
+                                    {deleteMode === "uninstall" ? "Uninstall & Remove Agent" : "Remove Agent"}
+                                </h3>
+                                <p className="text-[10px] text-gray-500">{agent.machine_name}</p>
+                            </div>
+                        </div>
+                        <p className="text-xs text-gray-400 leading-relaxed mb-4">
+                            {deleteMode === "uninstall"
+                                ? "This will send an uninstall command to the agent, stop the service, remove the software from the machine, and delete all records from the database."
+                                : "This will delete the agent from the database including all sessions, chat history, and group assignments. The agent software will remain installed on the machine."}
+                        </p>
+                        <div className="flex gap-2">
+                            <button
+                                onClick={() => setShowConfirm(false)}
+                                disabled={deleting}
+                                className="flex-1 px-3 py-2 bg-[#252525] hover:bg-[#333] text-gray-300 text-xs font-medium rounded-lg transition-colors border border-[#333]"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleDelete}
+                                disabled={deleting}
+                                className="flex-1 px-3 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-1.5 disabled:opacity-60"
+                            >
+                                {deleting ? (
+                                    <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Deleting...</>
+                                ) : (
+                                    <><Trash2 className="w-3.5 h-3.5" /> {deleteMode === "uninstall" ? "Uninstall & Remove" : "Remove"}</>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </>
+    );
+}
+

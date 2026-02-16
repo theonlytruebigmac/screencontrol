@@ -15,6 +15,18 @@ use uuid::Uuid;
 
 use sc_protocol::{envelope, Envelope, MonitorInfo, ScreenInfo};
 
+/// Handle for Mutter RemoteDesktop D-Bus input injection.
+/// Provides the D-Bus connection and session paths needed to call
+/// NotifyPointerMotionAbsolute, NotifyPointerButton, etc.
+#[cfg(target_os = "linux")]
+pub struct MutterInputHandle {
+    pub connection: zbus::Connection,
+    pub rd_session_path: zbus::zvariant::OwnedObjectPath,
+    pub stream_path: zbus::zvariant::OwnedObjectPath,
+    pub screen_width: u32,
+    pub screen_height: u32,
+}
+
 /// Manages screen capture sessions.
 pub struct DesktopCapturer {
     sessions: HashMap<String, CaptureHandle>,
@@ -53,14 +65,19 @@ impl DesktopCapturer {
     }
 
     /// Start screen capture using the platform-specific implementation.
+    /// On Linux, returns a receiver that resolves with the Mutter D-Bus
+    /// input handle once the RemoteDesktop session is established.
     pub fn start_capture(
         &mut self,
         session_id: &str,
         monitor_index: u32,
         ws_tx: mpsc::UnboundedSender<Vec<u8>>,
-    ) {
+    ) -> Option<oneshot::Receiver<MutterInputHandle>> {
         let sid = session_id.to_string();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        #[cfg(target_os = "linux")]
+        let (input_handle_tx, input_handle_rx) = oneshot::channel::<MutterInputHandle>();
 
         #[cfg(target_os = "linux")]
         let handle = tokio::spawn(linux::capture_session(
@@ -68,6 +85,7 @@ impl DesktopCapturer {
             monitor_index,
             ws_tx,
             shutdown_rx,
+            input_handle_tx,
         ));
 
         #[cfg(target_os = "macos")]
@@ -93,6 +111,12 @@ impl DesktopCapturer {
                 shutdown_tx: Some(shutdown_tx),
             },
         );
+
+        #[cfg(target_os = "linux")]
+        return Some(input_handle_rx);
+
+        #[cfg(not(target_os = "linux"))]
+        return None;
     }
 
     /// Stop an active capture session.
@@ -251,18 +275,19 @@ mod linux {
 
     use prost::Message as ProstMessage;
     use tokio::sync::mpsc;
-    use uuid::Uuid;
     use zbus::Connection;
 
     use sc_protocol::{envelope, DesktopFrame, Envelope};
 
-    const DEFAULT_FPS: u32 = 15;
-    const DEFAULT_QUALITY: u32 = 60;
+    const DEFAULT_FPS: u32 = 30;
+    const DEFAULT_QUALITY: u32 = 50;
 
     struct MutterScreenCast {
         node_id: u32,
         connection: Connection,
         session_path: zbus::zvariant::OwnedObjectPath,
+        rd_session_path: zbus::zvariant::OwnedObjectPath,
+        stream_path: zbus::zvariant::OwnedObjectPath,
     }
 
     pub async fn capture_session(
@@ -270,6 +295,7 @@ mod linux {
         monitor_index: u32,
         ws_tx: mpsc::UnboundedSender<Vec<u8>>,
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        input_handle_tx: tokio::sync::oneshot::Sender<super::MutterInputHandle>,
     ) {
         tracing::info!(
             "Starting Mutter ScreenCast capture for session {} (monitor {})",
@@ -289,32 +315,46 @@ mod linux {
         let node_id = screencast_info.node_id;
         tracing::info!(
             node_id,
-            "Mutter ScreenCast session started silently (no user dialog)"
+            "Mutter RemoteDesktop+ScreenCast session started silently (no user dialog)"
         );
 
         let dbus_conn = screencast_info.connection;
-        let session_path = screencast_info.session_path;
+        let _session_path = screencast_info.session_path;
+        let rd_session_path = screencast_info.rd_session_path;
+        let stream_path = screencast_info.stream_path;
+
+        // Send the D-Bus input handle back to the caller so it can
+        // create a MutterInputInjector
+        let (sw, sh) = super::get_total_screen_size();
+        let _ = input_handle_tx.send(super::MutterInputHandle {
+            connection: dbus_conn.clone(),
+            rd_session_path: rd_session_path.clone(),
+            stream_path: stream_path.clone(),
+            screen_width: sw,
+            screen_height: sh,
+        });
 
         // Spawn a keeper that waits for the shutdown signal, then
-        // properly stops the Mutter ScreenCast D-Bus session.
+        // properly stops the Mutter RemoteDesktop D-Bus session
+        // (which also stops the paired ScreenCast session).
         let keeper_conn = dbus_conn.clone();
-        let keeper_path = session_path.clone();
+        let keeper_rd_path = rd_session_path.clone();
         let _session_keeper = tokio::spawn(async move {
             // Wait for shutdown signal
             let _ = shutdown_rx.await;
-            tracing::info!("Stopping Mutter ScreenCast D-Bus session...");
+            tracing::info!("Stopping Mutter RemoteDesktop D-Bus session...");
             match keeper_conn
                 .call_method(
-                    Some("org.gnome.Mutter.ScreenCast"),
-                    keeper_path.as_ref(),
-                    Some("org.gnome.Mutter.ScreenCast.Session"),
+                    Some("org.gnome.Mutter.RemoteDesktop"),
+                    keeper_rd_path.as_ref(),
+                    Some("org.gnome.Mutter.RemoteDesktop.Session"),
                     "Stop",
                     &(),
                 )
                 .await
             {
-                Ok(_) => tracing::info!("Mutter ScreenCast session stopped via D-Bus"),
-                Err(e) => tracing::warn!("Failed to stop Mutter ScreenCast session: {}", e),
+                Ok(_) => tracing::info!("Mutter RemoteDesktop session stopped via D-Bus"),
+                Err(e) => tracing::warn!("Failed to stop Mutter RemoteDesktop session: {}", e),
             }
         });
 
@@ -332,14 +372,43 @@ mod linux {
     async fn request_mutter_screencast() -> anyhow::Result<MutterScreenCast> {
         let connection = Connection::session().await?;
 
-        // Session properties — disable animations to avoid visual artifacts
+        // ── Step 1: Create a RemoteDesktop session ──
+        // This provides input injection via D-Bus without going through
+        // the portal (no consent dialog).
+        let rd_session_path: zbus::zvariant::OwnedObjectPath = connection
+            .call_method(
+                Some("org.gnome.Mutter.RemoteDesktop"),
+                "/org/gnome/Mutter/RemoteDesktop",
+                Some("org.gnome.Mutter.RemoteDesktop"),
+                "CreateSession",
+                &(),
+            )
+            .await?
+            .body()
+            .deserialize()?;
+
+        tracing::info!(rd_session_path = %rd_session_path, "Mutter RemoteDesktop session created");
+
+        // ── Step 2: Create a ScreenCast session paired to the RemoteDesktop session ──
+        // The 'remote-desktop-session-id' property links the two sessions.
+        let rd_session_id = rd_session_path
+            .as_str()
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+
         let mut session_props = std::collections::HashMap::<String, zbus::zvariant::Value>::new();
         session_props.insert(
             "disable-animations".to_string(),
             zbus::zvariant::Value::Bool(true),
         );
+        session_props.insert(
+            "remote-desktop-session-id".to_string(),
+            zbus::zvariant::Value::Str(rd_session_id.clone().into()),
+        );
 
-        let reply: zbus::zvariant::OwnedObjectPath = connection
+        let sc_session_path: zbus::zvariant::OwnedObjectPath = connection
             .call_method(
                 Some("org.gnome.Mutter.ScreenCast"),
                 "/org/gnome/Mutter/ScreenCast",
@@ -351,7 +420,11 @@ mod linux {
             .body()
             .deserialize()?;
 
-        tracing::info!(session_path = %reply, "Mutter ScreenCast session created");
+        tracing::info!(
+            sc_session_path = %sc_session_path,
+            rd_session_id = %rd_session_id,
+            "Mutter ScreenCast session created (paired with RemoteDesktop)"
+        );
 
         // Stream properties — suppress recording indicator and embed cursor
         let mut stream_props = std::collections::HashMap::<String, zbus::zvariant::Value>::new();
@@ -364,10 +437,10 @@ mod linux {
             zbus::zvariant::Value::U32(1), // 1 = embedded in stream
         );
 
-        let stream_reply: zbus::zvariant::OwnedObjectPath = connection
+        let stream_path: zbus::zvariant::OwnedObjectPath = connection
             .call_method(
                 Some("org.gnome.Mutter.ScreenCast"),
-                reply.as_ref(),
+                sc_session_path.as_ref(),
                 Some("org.gnome.Mutter.ScreenCast.Session"),
                 "RecordMonitor",
                 &("", stream_props),
@@ -376,8 +449,9 @@ mod linux {
             .body()
             .deserialize()?;
 
-        tracing::info!(stream_path = %stream_reply, "Mutter ScreenCast stream created");
+        tracing::info!(stream_path = %stream_path, "Mutter ScreenCast stream created");
 
+        // ── Step 3: Listen for PipeWireStreamAdded, then Start the RemoteDesktop session ──
         use tokio::sync::oneshot;
         let (node_tx, node_rx) = oneshot::channel::<u32>();
 
@@ -400,17 +474,20 @@ mod linux {
             }
         });
 
+        // Start the RemoteDesktop session — this also starts the paired ScreenCast session
         connection
             .call_method(
-                Some("org.gnome.Mutter.ScreenCast"),
-                reply.as_ref(),
-                Some("org.gnome.Mutter.ScreenCast.Session"),
+                Some("org.gnome.Mutter.RemoteDesktop"),
+                rd_session_path.as_ref(),
+                Some("org.gnome.Mutter.RemoteDesktop.Session"),
                 "Start",
                 &(),
             )
             .await?;
 
-        tracing::info!("Mutter ScreenCast session started, waiting for PipeWire node_id...");
+        tracing::info!(
+            "Mutter RemoteDesktop+ScreenCast session started, waiting for PipeWire node_id..."
+        );
 
         let node_id = tokio::time::timeout(std::time::Duration::from_secs(5), node_rx)
             .await
@@ -424,7 +501,9 @@ mod linux {
         Ok(MutterScreenCast {
             node_id,
             connection,
-            session_path: reply,
+            session_path: sc_session_path,
+            rd_session_path,
+            stream_path,
         })
     }
 
@@ -504,8 +583,16 @@ mod linux {
                             }
                         }
 
+                        // Backpressure: if channel is lagging, skip this frame
+                        // (unbounded channels report 0 for len, so this is best-effort)
+                        if ws_tx.is_closed() {
+                            tracing::info!("WS channel closed, stopping capture");
+                            let _ = child.kill();
+                            return;
+                        }
+
                         let envelope = Envelope {
-                            id: Uuid::new_v4().to_string(),
+                            id: "f".to_string(),
                             session_id: sid.clone(),
                             timestamp: None,
                             payload: Some(envelope::Payload::DesktopFrame(DesktopFrame {
@@ -517,14 +604,14 @@ mod linux {
                             })),
                         };
 
-                        let mut buf = Vec::new();
+                        let mut buf = Vec::with_capacity(jpeg_len + 64);
                         if envelope.encode(&mut buf).is_ok() {
                             if ws_tx.send(buf).is_err() {
                                 tracing::info!("WS channel closed, stopping capture");
                                 let _ = child.kill();
                                 return;
                             }
-                            if seq % 30 == 0 {
+                            if seq % 60 == 0 {
                                 tracing::info!(seq, jpeg_bytes = jpeg_len, "Sent desktop frame");
                             }
                         }

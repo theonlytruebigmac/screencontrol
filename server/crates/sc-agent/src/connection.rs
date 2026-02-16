@@ -79,6 +79,7 @@ pub async fn connect_and_run(
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             tenant_token: tenant_token.to_string(),
             group_name: group_name.to_string(),
+            instance_id: String::new(), // populated in Phase 3
         })),
     };
 
@@ -274,6 +275,33 @@ pub async fn connect_and_run(
                                         }
                                     });
                                 }
+
+                                // If the server signals an update is available, trigger immediate update
+                                if ack.update_available && !ack.update_download_url.is_empty() {
+                                    let base = http_base.clone();
+                                    let download_url = if ack.update_download_url.starts_with('/') {
+                                        format!("{}{}", base, ack.update_download_url)
+                                    } else {
+                                        ack.update_download_url.clone()
+                                    };
+                                    let sha256 = ack.update_sha256.clone();
+                                    let version = ack.update_version.clone();
+                                    tracing::info!(
+                                        "Server signaled update available: v{} — triggering immediate update",
+                                        version
+                                    );
+                                    tokio::spawn(async move {
+                                        if let Err(e) = crate::updater::apply_update_from_hint(
+                                            &download_url,
+                                            &sha256,
+                                            &version,
+                                        )
+                                        .await
+                                        {
+                                            tracing::error!("Immediate update failed: {}", e);
+                                        }
+                                    });
+                                }
                             }
                             Some(envelope::Payload::SessionRequest(req)) => {
                                 tracing::info!(
@@ -415,30 +443,75 @@ pub async fn connect_and_run(
                                         let _ = tx.send(info_buf);
                                     }
 
-                                    // Start screen capture
-                                    desktop_capturer.start_capture(
+                                    // Start screen capture (returns D-Bus input handle on Linux)
+                                    let input_handle_rx = desktop_capturer.start_capture(
                                         &session_id,
                                         req.monitor_index,
                                         tx.clone(),
                                     );
 
-                                    // Initialize input injector with actual screen dimensions
-                                    let (sw, sh) = crate::screen::get_total_screen_size();
-                                    match InputInjector::new(sw, sh) {
-                                        Ok(inj) => {
-                                            tracing::info!(
-                                                "InputInjector created successfully ({}x{})",
-                                                sw,
-                                                sh
-                                            );
-                                            input_injector = Some(inj);
+                                    // Create input injector — prefer Mutter D-Bus on Linux/Wayland
+                                    #[cfg(target_os = "linux")]
+                                    {
+                                        if let Some(rx) = input_handle_rx {
+                                            // Wait for the Mutter RemoteDesktop session to be ready
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_secs(5),
+                                                rx,
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(handle)) => {
+                                                    let inj = crate::input::MutterInputInjector::from_handle(handle);
+                                                    input_injector =
+                                                        Some(InputInjector::Mutter(inj));
+                                                    tracing::info!("MutterInputInjector (D-Bus) created — no consent dialog needed");
+                                                }
+                                                Ok(Err(_)) => {
+                                                    tracing::warn!("Mutter input handle channel dropped, falling back to enigo");
+                                                    let (sw, sh) =
+                                                        crate::screen::get_total_screen_size();
+                                                    if let Ok(inj) =
+                                                        crate::input::EnigoInputInjector::new(
+                                                            sw, sh,
+                                                        )
+                                                    {
+                                                        input_injector =
+                                                            Some(InputInjector::Enigo(inj));
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    tracing::warn!("Timed out waiting for Mutter input handle, falling back to enigo");
+                                                    let (sw, sh) =
+                                                        crate::screen::get_total_screen_size();
+                                                    if let Ok(inj) =
+                                                        crate::input::EnigoInputInjector::new(
+                                                            sw, sh,
+                                                        )
+                                                    {
+                                                        input_injector =
+                                                            Some(InputInjector::Enigo(inj));
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            let (sw, sh) = crate::screen::get_total_screen_size();
+                                            if let Ok(inj) =
+                                                crate::input::EnigoInputInjector::new(sw, sh)
+                                            {
+                                                input_injector = Some(InputInjector::Enigo(inj));
+                                            }
                                         }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to create InputInjector: {:?}",
-                                                e
-                                            );
-                                            input_injector = None;
+                                    }
+
+                                    #[cfg(not(target_os = "linux"))]
+                                    {
+                                        let _ = input_handle_rx; // suppress unused warning
+                                        let (sw, sh) = crate::screen::get_total_screen_size();
+                                        if let Ok(inj) =
+                                            crate::input::EnigoInputInjector::new(sw, sh)
+                                        {
+                                            input_injector = Some(InputInjector::Enigo(inj));
                                         }
                                     }
 

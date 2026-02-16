@@ -70,6 +70,7 @@ message AgentRegistration {
     string agent_version = 6;
     string tenant_token = 7;   // tenant enrollment token
     string group_name = 8;     // optional: group to auto-assign on registration
+    string instance_id = 9;    // server instance UUID for binding
 }
 
 message AgentRegistrationAck {
@@ -94,6 +95,10 @@ message Heartbeat {
 message HeartbeatAck {
     uint32 interval_secs = 1;  // server tells agent next heartbeat interval
     string thumbnail_upload_url = 2;  // pre-signed PUT URL for desktop thumbnail
+    bool   update_available = 3;      // server detected a newer agent version
+    string update_version = 4;        // target version, e.g. "0.2.0"
+    string update_download_url = 5;   // relative download path for the binary
+    string update_sha256 = 6;         // SHA-256 checksum for verification
 }
 
 // ─── Agent Info ──────────────────────────────────────────────

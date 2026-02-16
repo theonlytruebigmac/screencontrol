@@ -14,6 +14,8 @@ mod scripts;
 mod sessions;
 mod settings;
 mod stats;
+mod update_check;
+pub mod update_policy;
 mod users;
 
 use crate::AppState;
@@ -36,5 +38,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/api-keys", api_keys::router(state.clone()))
         .nest("/downloads", downloads::router())
         .nest("/installer", installer::router(state.clone()))
+        .nest("/agent", update_check::router())
+        .nest("/admin", update_policy::router(state.clone()))
         .merge(health::router())
 }

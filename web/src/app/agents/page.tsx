@@ -122,7 +122,7 @@ export default function AgentsPage() {
                     search={search}
                     onSearchChange={setSearch}
                 />
-                <AgentDetail agent={selectedAgent} />
+                <AgentDetail agent={selectedAgent} onDelete={() => { setSelectedId(null); fetchAgents(); }} />
             </div>
             {showDeploy && <BuildInstallerDialog open={showDeploy} onClose={() => setShowDeploy(false)} />}
         </>

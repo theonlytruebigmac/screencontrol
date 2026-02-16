@@ -75,6 +75,43 @@ function codeToKeyCode(code: string): number | null {
     return map[code] ?? null;
 }
 
+/**
+ * Draw a standard arrow cursor on the canvas.
+ * The cursor is drawn at (cx, cy) with size proportional to canvas width
+ * so it looks correct regardless of stream resolution.
+ */
+function drawCursorArrow(ctx: CanvasRenderingContext2D, cx: number, cy: number, canvasWidth: number) {
+    // Scale cursor size proportionally: ~24px at 1920w, smaller/larger at other resolutions
+    const scale = Math.max(canvasWidth / 1920, 0.5);
+    const s = scale;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+
+    // Standard arrow cursor shape (tip at origin, pointing down-right)
+    ctx.beginPath();
+    ctx.moveTo(0, 0);             // tip
+    ctx.lineTo(0, 21 * s);        // down
+    ctx.lineTo(4.2 * s, 17 * s);  // notch right
+    ctx.lineTo(7.8 * s, 24 * s);  // arrow tail right
+    ctx.lineTo(11 * s, 22.5 * s); // arrow tail right top
+    ctx.lineTo(7.2 * s, 15.8 * s);// notch inner
+    ctx.lineTo(12.5 * s, 15.8 * s);// wing right
+    ctx.closePath();
+
+    // Black outline
+    ctx.lineWidth = 2 * s;
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#000000';
+    ctx.stroke();
+
+    // White fill
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+
+    ctx.restore();
+}
+
 const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(function DesktopViewer(
     { sessionId, className, showStatusBar = false, onStatusChange, onMonitorsChange, onResolutionChange, onFpsChange },
     ref
@@ -87,6 +124,7 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
     const [fps, setFps] = useState(0);
     const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
     const [hasFocus, setHasFocus] = useState(false);
+    const cursorNormRef = useRef<{ x: number; y: number } | null>(null);
     const frameCountRef = useRef(0);
     const lastFpsTimeRef = useRef(Date.now());
     const mouseMoveThrottleRef = useRef(0);
@@ -94,6 +132,8 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
     const reconnectAttemptRef = useRef(0);
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const cancelledRef = useRef(false);
+    const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+    const pendingFrameRef = useRef(0); // tracks in-flight frame decodes
 
     // Propagate state to parent
     useEffect(() => { onStatusChange?.(status); }, [status, onStatusChange]);
@@ -151,26 +191,47 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
             switch (envelope.payload.type) {
                 case 'desktop_frame': {
                     const frame = envelope.payload;
-                    const blob = new Blob([new Uint8Array(frame.data)], { type: 'image/jpeg' });
-                    const url = URL.createObjectURL(blob);
-                    const img = new Image();
-                    img.onload = () => {
-                        if (cancelledRef.current) { URL.revokeObjectURL(url); return; }
-                        const canvas = canvasRef.current;
-                        if (!canvas) { URL.revokeObjectURL(url); return; }
 
-                        if (canvas.width !== img.width || canvas.height !== img.height) {
-                            canvas.width = img.width;
-                            canvas.height = img.height;
-                            setResolution({ width: img.width, height: img.height });
+                    // Frame-skip: if a decode is already in flight, drop this frame
+                    if (pendingFrameRef.current > 1) {
+                        break;
+                    }
+                    pendingFrameRef.current++;
+
+                    const blob = new Blob([new Uint8Array(frame.data)], { type: 'image/jpeg' });
+                    createImageBitmap(blob).then((bitmap) => {
+                        pendingFrameRef.current--;
+                        if (cancelledRef.current) { bitmap.close(); return; }
+                        const canvas = canvasRef.current;
+                        if (!canvas) { bitmap.close(); return; }
+
+                        if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+                            canvas.width = bitmap.width;
+                            canvas.height = bitmap.height;
+                            ctxRef.current = null; // invalidated by resize
+                            setResolution({ width: bitmap.width, height: bitmap.height });
                         }
 
-                        const ctx = canvas.getContext('2d');
-                        if (ctx) ctx.drawImage(img, 0, 0);
-                        URL.revokeObjectURL(url);
+                        // Acquire 2D context once and cache
+                        if (!ctxRef.current) {
+                            ctxRef.current = canvas.getContext('2d');
+                        }
+                        const ctx = ctxRef.current;
+                        if (ctx) {
+                            ctx.drawImage(bitmap, 0, 0);
+                            // Draw cursor arrow on top of frame
+                            const cp = cursorNormRef.current;
+                            if (cp) {
+                                const cx = cp.x * canvas.width;
+                                const cy = cp.y * canvas.height;
+                                drawCursorArrow(ctx, cx, cy, canvas.width);
+                            }
+                        }
+                        bitmap.close(); // release GPU memory immediately
                         frameCountRef.current++;
-                    };
-                    img.src = url;
+                    }).catch(() => {
+                        pendingFrameRef.current--;
+                    });
                     break;
                 }
                 case 'screen_info': {
@@ -319,12 +380,16 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
                     onFocus={() => setHasFocus(true)}
                     onBlur={() => setHasFocus(false)}
                     onMouseMove={(e) => {
-                        const now = Date.now();
-                        if (now - mouseMoveThrottleRef.current < 16) return;
-                        mouseMoveThrottleRef.current = now;
                         const { x, y } = getNormCoords(e);
+                        // Store normalized position for cursor drawing (on every move for smoothness)
+                        cursorNormRef.current = { x, y };
+
+                        const now = Date.now();
+                        if (now - mouseMoveThrottleRef.current < 8) return;
+                        mouseMoveThrottleRef.current = now;
                         sendBinary(encodeMouseMove(sessionId, x, y));
                     }}
+                    onMouseLeave={() => { cursorNormRef.current = null; }}
                     onMouseDown={(e) => {
                         // Focus on click
                         canvasRef.current?.focus();
@@ -364,6 +429,8 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
                     }}
                     onContextMenu={(e) => e.preventDefault()}
                 />
+
+
             </div>
 
             <style jsx>{`

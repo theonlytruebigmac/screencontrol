@@ -1,12 +1,12 @@
 //! Cross-platform service installer for ScreenControl Agent.
 //!
 //! Supports:
-//! - **Linux**: systemd service unit
-//! - **macOS**: launchd plist (LaunchDaemon)
-//! - **Windows**: Windows Service via `sc.exe`
+//! - **Linux**: systemd service unit (runs as root)
+//! - **macOS**: launchd plist (LaunchDaemon, runs as root)
+//! - **Windows**: Windows Service via `sc.exe` (runs as LocalSystem)
 //!
 //! Usage:
-//!   sc-agent install --server-url ws://... --token ... [--group "Group Name"]
+//!   sc-agent install --server-url ws://... --token ... [--group "Group Name"] [--silent]
 //!   sc-agent uninstall
 //!   sc-agent run
 
@@ -26,9 +26,10 @@ pub struct InstallConfig {
     pub group: String,
 }
 
-/// Get the standard install directory for this platform.
-#[allow(dead_code)]
-fn install_dir() -> PathBuf {
+// ─── Uniform directory helpers ─────────────────────────────────────
+
+/// Directory where the agent binary lives.
+pub fn install_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into()))
@@ -44,14 +45,80 @@ fn install_dir() -> PathBuf {
     }
 }
 
+/// Directory where configuration files are stored.
+pub fn config_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".into()))
+            .join("ScreenControl")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS keeps config alongside binary (in Application Support)
+        PathBuf::from("/Library/Application Support/ScreenControl")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/etc/screencontrol")
+    }
+}
+
+/// Directory for agent log files.
+pub fn log_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".into()))
+            .join("ScreenControl")
+            .join("logs")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/var/log")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/var/log/screencontrol")
+    }
+}
+
+/// Directory for persistent agent data (cache, state, etc.).
+pub fn data_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".into()))
+            .join("ScreenControl")
+            .join("data")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library/Application Support/ScreenControl/data")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/var/lib/screencontrol")
+    }
+}
+
+/// Path to the config file on this platform.
+pub fn config_file() -> PathBuf {
+    config_dir().join("config.env")
+}
+
+// ─── Install / Uninstall ───────────────────────────────────────────
+
 /// Install the agent as a system service.
 pub fn install(config: InstallConfig) -> anyhow::Result<()> {
     let src_exe = std::env::current_exe()?;
-    let dir = install_dir();
+    let bin_dir = install_dir();
+    let cfg_dir = config_dir();
+    let lg_dir = log_dir();
+    let dt_dir = data_dir();
 
-    // Create install directory
-    std::fs::create_dir_all(&dir)?;
-    tracing::info!("Install directory: {:?}", dir);
+    // Create all directories
+    for dir in [&bin_dir, &cfg_dir, &lg_dir, &dt_dir] {
+        std::fs::create_dir_all(dir)?;
+        tracing::info!("Ensured directory: {:?}", dir);
+    }
 
     // Copy agent binary to install directory
     let exe_name = if cfg!(windows) {
@@ -59,7 +126,7 @@ pub fn install(config: InstallConfig) -> anyhow::Result<()> {
     } else {
         "sc-agent"
     };
-    let dest_exe = dir.join(exe_name);
+    let dest_exe = bin_dir.join(exe_name);
     if src_exe != dest_exe {
         std::fs::copy(&src_exe, &dest_exe)?;
         #[cfg(unix)]
@@ -70,8 +137,8 @@ pub fn install(config: InstallConfig) -> anyhow::Result<()> {
         tracing::info!("Copied binary to {:?}", dest_exe);
     }
 
-    // Write .env configuration
-    let env_path = dir.join(".env");
+    // Write configuration
+    let cfg_path = config_file();
     let mut env_content = format!(
         "SC_SERVER_URL={}\nSC_TENANT_TOKEN={}\n",
         config.server_url, config.token
@@ -79,8 +146,20 @@ pub fn install(config: InstallConfig) -> anyhow::Result<()> {
     if !config.group.is_empty() {
         env_content.push_str(&format!("SC_GROUP={}\n", config.group));
     }
-    std::fs::write(&env_path, &env_content)?;
-    tracing::info!("Wrote configuration to {:?}", env_path);
+    // Point log output to our log directory
+    env_content.push_str(&format!(
+        "SC_LOG_DIR={}\nSC_DATA_DIR={}\n",
+        lg_dir.display(),
+        dt_dir.display()
+    ));
+    std::fs::write(&cfg_path, &env_content)?;
+    tracing::info!("Wrote configuration to {:?}", cfg_path);
+
+    // Also write a legacy `.env` next to the binary for backward compat
+    let legacy_env = bin_dir.join(".env");
+    if cfg_path != legacy_env {
+        std::fs::write(&legacy_env, &env_content)?;
+    }
 
     // Install platform-specific service
     #[cfg(target_os = "linux")]
@@ -93,15 +172,18 @@ pub fn install(config: InstallConfig) -> anyhow::Result<()> {
     install_windows_service(&dest_exe)?;
 
     println!("✅ ScreenControl Agent installed successfully");
-    println!("   Directory: {}", dir.display());
-    println!("   Server:    {}", config.server_url);
+    println!("   Binary:  {}", dest_exe.display());
+    println!("   Config:  {}", cfg_path.display());
+    println!("   Logs:    {}", lg_dir.display());
+    println!("   Data:    {}", dt_dir.display());
+    println!("   Server:  {}", config.server_url);
     if !config.group.is_empty() {
-        println!("   Group:     {}", config.group);
+        println!("   Group:   {}", config.group);
     }
     Ok(())
 }
 
-/// Uninstall the system service.
+/// Uninstall the system service and clean up directories.
 pub fn uninstall() -> anyhow::Result<()> {
     tracing::info!("Uninstalling {}", SERVICE_NAME);
 
@@ -123,36 +205,47 @@ pub fn uninstall() -> anyhow::Result<()> {
 #[cfg(target_os = "linux")]
 fn install_systemd(exe_path: &PathBuf) -> anyhow::Result<()> {
     let unit_path = PathBuf::from("/etc/systemd/system").join(format!("{}.service", SERVICE_NAME));
-
-    // Load environment file path (for SC_SERVER_URL, SC_TENANT_TOKEN)
-    let env_file = exe_path
-        .parent()
-        .unwrap_or(std::path::Path::new("/opt/screencontrol"))
-        .join(".env");
+    let cfg_file = config_file();
+    let lg_dir = log_dir();
+    let dt_dir = data_dir();
 
     let unit_content = format!(
         r#"[Unit]
 Description={description}
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart={exe}
 Restart=always
 RestartSec=5
-EnvironmentFile=-{env_file}
-# Security hardening
-NoNewPrivileges=false
-ProtectSystem=strict
-ReadWritePaths=/tmp
+EnvironmentFile=-{config_file}
+
+# Logging — use journal with syslog identifier
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=screencontrol-agent
+
+# Runs as root for screen capture / input injection access
+# (similar to ScreenConnect agent)
+
+# Allow writes to our directories
+ReadWritePaths={log_dir} {data_dir} /tmp
+
+# Restart policies
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
 "#,
         description = SERVICE_DESCRIPTION,
         exe = exe_path.display(),
-        env_file = env_file.display(),
+        config_file = cfg_file.display(),
+        log_dir = lg_dir.display(),
+        data_dir = dt_dir.display(),
     );
 
     std::fs::write(&unit_path, unit_content)?;
@@ -174,8 +267,9 @@ WantedBy=multi-user.target
     }
 
     println!("✅ Service installed and started: {}", SERVICE_NAME);
-    println!("   View logs:  journalctl -u {} -f", SERVICE_NAME);
-    println!("   Stop:       sudo systemctl stop {}", SERVICE_NAME);
+    println!("   Logs:    journalctl -u {} -f", SERVICE_NAME);
+    println!("   Stop:    sudo systemctl stop {}", SERVICE_NAME);
+    println!("   Restart: sudo systemctl restart {}", SERVICE_NAME);
     Ok(())
 }
 
@@ -198,7 +292,16 @@ fn uninstall_systemd() -> anyhow::Result<()> {
         .args(["daemon-reload"])
         .status();
 
-    println!("✅ Service uninstalled: {}", SERVICE_NAME);
+    // Clean up directories
+    let dirs_to_clean = [install_dir(), config_dir(), log_dir(), data_dir()];
+    for dir in &dirs_to_clean {
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(dir);
+            tracing::info!("Removed directory: {:?}", dir);
+        }
+    }
+
+    println!("✅ Service and files uninstalled: {}", SERVICE_NAME);
     Ok(())
 }
 
@@ -220,6 +323,10 @@ fn install_launchd(exe_path: &PathBuf) -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&macos_dir)?;
     std::fs::create_dir_all(&resources_dir)?;
+
+    // Create data directory
+    let dt_dir = data_dir();
+    std::fs::create_dir_all(&dt_dir)?;
 
     // Copy binary into the .app bundle
     let bundle_exe = macos_dir.join("sc-agent");
@@ -285,13 +392,6 @@ fn install_launchd(exe_path: &PathBuf) -> anyhow::Result<()> {
     std::fs::write(contents_dir.join("Info.plist"), &info_plist)?;
 
     // ── Codesign the .app bundle with a stable identifier ──────────
-    // macOS TCC tracks permissions by code signing identity. Without signing,
-    // TCC uses the binary's cdhash which changes every build/update, causing
-    // Screen Recording and Accessibility approvals to be revoked on upgrade.
-    //
-    // Ad-hoc signing with a consistent --identifier ensures TCC can match
-    // the app across binary updates. For production, replace "-" with a
-    // Developer ID certificate identity.
     let codesign_status = std::process::Command::new("codesign")
         .args([
             "--force",
@@ -299,7 +399,7 @@ fn install_launchd(exe_path: &PathBuf) -> anyhow::Result<()> {
             "--sign",
             "-",
             "--identifier",
-            label, // com.screencontrol.agent
+            label,
             app_dir.to_str().unwrap_or_default(),
         ])
         .status();
@@ -319,12 +419,12 @@ fn install_launchd(exe_path: &PathBuf) -> anyhow::Result<()> {
         }
     }
 
-    // ── Read environment variables from .env file ──
-    let env_file = install_dir.join(".env");
+    // ── Read environment variables from config file ──
+    let cfg_file = config_file();
 
     let mut env_entries = String::new();
-    if env_file.exists() {
-        if let Ok(contents) = std::fs::read_to_string(&env_file) {
+    if cfg_file.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&cfg_file) {
             for line in contents.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -447,6 +547,12 @@ fn uninstall_launchd() -> anyhow::Result<()> {
         tracing::info!("Removed install directory: {:?}", dir);
     }
 
+    // Remove data directory
+    let dt = data_dir();
+    if dt.exists() {
+        let _ = std::fs::remove_dir_all(&dt);
+    }
+
     println!("✅ Service uninstalled: {}", label);
     Ok(())
 }
@@ -455,14 +561,16 @@ fn uninstall_launchd() -> anyhow::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn install_windows_service(exe_path: &PathBuf) -> anyhow::Result<()> {
-    // Use sc.exe to create the service
+    // Create the Windows Service using sc.exe
+    // The service runs as LocalSystem for full desktop/input access
     let status = std::process::Command::new("sc.exe")
         .args([
             "create",
             SERVICE_NAME,
             &format!("binPath= \"{}\"", exe_path.display()),
             &format!("DisplayName= \"{}\"", SERVICE_DISPLAY_NAME),
-            "start= auto",
+            "start= delayed-auto",
+            "obj= LocalSystem",
         ])
         .status()?;
 
@@ -475,7 +583,7 @@ fn install_windows_service(exe_path: &PathBuf) -> anyhow::Result<()> {
         .args(["description", SERVICE_NAME, SERVICE_DESCRIPTION])
         .status();
 
-    // Configure failure recovery (restart on crash)
+    // Configure failure recovery (restart on crash with escalating delays)
     let _ = std::process::Command::new("sc.exe")
         .args([
             "failure",
@@ -483,6 +591,11 @@ fn install_windows_service(exe_path: &PathBuf) -> anyhow::Result<()> {
             "reset= 86400",
             "actions= restart/5000/restart/10000/restart/30000",
         ])
+        .status();
+
+    // Allow service to interact with desktop (needed for screen capture)
+    let _ = std::process::Command::new("sc.exe")
+        .args(["config", SERVICE_NAME, "type= interact", "type= own"])
         .status();
 
     // Start the service
@@ -494,8 +607,11 @@ fn install_windows_service(exe_path: &PathBuf) -> anyhow::Result<()> {
     }
 
     println!("✅ Service installed: {}", SERVICE_NAME);
-    println!("   Status: sc.exe query {}", SERVICE_NAME);
-    println!("   Stop:   sc.exe stop {}", SERVICE_NAME);
+    println!("   Account: LocalSystem");
+    println!("   Startup: Delayed Auto-Start");
+    println!("   Status:  sc.exe query {}", SERVICE_NAME);
+    println!("   Stop:    sc.exe stop {}", SERVICE_NAME);
+    println!("   Logs:    {}", log_dir().display());
     Ok(())
 }
 
@@ -516,6 +632,18 @@ fn uninstall_windows_service() -> anyhow::Result<()> {
         anyhow::bail!("sc.exe delete failed — are you running as Administrator?");
     }
 
-    println!("✅ Service uninstalled: {}", SERVICE_NAME);
+    // Clean up directories
+    let install = install_dir();
+    if install.exists() {
+        let _ = std::fs::remove_dir_all(&install);
+        tracing::info!("Removed install directory: {:?}", install);
+    }
+    let config = config_dir();
+    if config.exists() {
+        let _ = std::fs::remove_dir_all(&config);
+        tracing::info!("Removed config directory: {:?}", config);
+    }
+
+    println!("✅ Service and files uninstalled: {}", SERVICE_NAME);
     Ok(())
 }

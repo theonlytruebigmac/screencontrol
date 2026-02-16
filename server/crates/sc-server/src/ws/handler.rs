@@ -69,7 +69,7 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>) {
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                tracing::info!(bytes = data.len(), "Agent binary message received");
+                tracing::debug!(bytes = data.len(), "Agent binary message received");
                 match Envelope::decode(data.as_ref()) {
                     Ok(envelope) => {
                         let session_id = envelope.session_id.clone();
@@ -114,13 +114,12 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>) {
                                 }
                             }
 
-                            // ── Desktop frame (relay to console) ──
-                            Some(envelope::Payload::DesktopFrame(ref frame)) => {
+                            // ── Desktop frame (relay to console — zero-copy) ──
+                            Some(envelope::Payload::DesktopFrame(_)) => {
                                 if let Ok(sid) = Uuid::parse_str(&session_id) {
                                     let ok = state.registry.send_to_console(&sid, data.to_vec());
-                                    tracing::info!(
+                                    tracing::debug!(
                                         %session_id,
-                                        frame_seq = frame.sequence,
                                         frame_bytes = data.len(),
                                         relay_ok = ok,
                                         "DesktopFrame relay"
@@ -268,6 +267,10 @@ async fn handle_console_socket(socket: WebSocket, session_id: Uuid, state: Arc<A
             payload: Some(envelope::Payload::HeartbeatAck(HeartbeatAck {
                 interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
                 thumbnail_upload_url: upload_path,
+                update_available: false,
+                update_version: String::new(),
+                update_download_url: String::new(),
+                update_sha256: String::new(),
             })),
         };
         let mut buf = Vec::new();
@@ -575,26 +578,73 @@ async fn handle_console_socket(socket: WebSocket, session_id: Uuid, state: Arc<A
 // ─── Sub-handlers ────────────────────────────────────────────
 
 /// Process agent registration, upsert in DB, register in connection registry.
+///
+/// Registration tiers:
+/// 1. Valid tenant token → assign to tenant, optionally to a group
+/// 2. No token, but valid instance_id → auto-assign to default "Unassigned" group
+/// 3. Neither → reject
 async fn handle_agent_registration(
     state: &AppState,
     tx: &mpsc::UnboundedSender<Message>,
     reg: &sc_protocol::AgentRegistration,
 ) -> Option<Uuid> {
-    // Validate tenant token
-    let tenant_row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM tenants WHERE enrollment_token = $1")
-            .bind(&reg.tenant_token)
-            .fetch_optional(&state.db)
-            .await
-            .ok()?;
+    // ── Tier 1: Try tenant token first ───────────────────────
+    let tenant_id = if !reg.tenant_token.is_empty() {
+        let tenant_row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM tenants WHERE enrollment_token = $1")
+                .bind(&reg.tenant_token)
+                .fetch_optional(&state.db)
+                .await
+                .ok()?;
 
-    let tenant_id = match tenant_row {
-        Some((tid,)) => tid,
-        None => {
-            tracing::warn!("Agent registration failed — invalid tenant token");
-            send_registration_ack(tx, false, "Invalid tenant token", "");
+        match tenant_row {
+            Some((tid,)) => tid,
+            None => {
+                tracing::warn!("Agent registration — invalid tenant token");
+                send_registration_ack(tx, false, "Invalid tenant token", "");
+                return None;
+            }
+        }
+    }
+    // ── Tier 2: No token, validate instance_id ───────────────
+    else if !reg.instance_id.is_empty() {
+        // Verify instance_id matches this server
+        if reg.instance_id != state.instance_id {
+            tracing::warn!(
+                "Agent registration — instance_id mismatch: expected {}, got {}",
+                state.instance_id,
+                reg.instance_id
+            );
+            send_registration_ack(tx, false, "Unknown server instance", "");
             return None;
         }
+
+        // Look up the default tenant (single-tenant mode)
+        let default_tenant: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1")
+                .fetch_optional(&state.db)
+                .await
+                .ok()?;
+
+        match default_tenant {
+            Some((tid,)) => tid,
+            None => {
+                tracing::error!("No tenants exist — cannot register agent");
+                send_registration_ack(tx, false, "Server has no configured tenant", "");
+                return None;
+            }
+        }
+    }
+    // ── Tier 3: Neither token nor instance_id ────────────────
+    else {
+        tracing::warn!("Agent registration — no token and no instance_id");
+        send_registration_ack(
+            tx,
+            false,
+            "Enrollment token or server instance ID required",
+            "",
+        );
+        return None;
     };
 
     // Determine agent_id: use the one provided or generate a new one
@@ -609,12 +659,13 @@ async fn handle_agent_registration(
     // Upsert agent in database
     let result = sqlx::query(
         r#"
-        INSERT INTO agents (id, tenant_id, machine_name, os, os_version, arch, agent_version, status, last_seen, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'online', $8, $8)
+        INSERT INTO agents (id, tenant_id, machine_name, os, os_version, arch, agent_version, instance_id, status, last_seen, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'online', $9, $9)
         ON CONFLICT (tenant_id, machine_name) DO UPDATE SET
             os_version = EXCLUDED.os_version,
             arch = EXCLUDED.arch,
             agent_version = EXCLUDED.agent_version,
+            instance_id = EXCLUDED.instance_id,
             status = 'online',
             last_seen = EXCLUDED.last_seen
         "#,
@@ -626,6 +677,7 @@ async fn handle_agent_registration(
     .bind(&reg.os_version)
     .bind(&reg.arch)
     .bind(&reg.agent_version)
+    .bind(&reg.instance_id)
     .bind(now)
     .execute(&state.db)
     .await;
@@ -639,9 +691,21 @@ async fn handle_agent_registration(
             send_registration_ack(tx, true, "Registered successfully", &agent_id.to_string());
             tracing::info!(%agent_id, machine_name = %reg.machine_name, "Agent registered");
 
-            // Auto-assign to group if group_name was provided
-            if !reg.group_name.is_empty() {
-                assign_agent_to_group(&state.db, tenant_id, agent_id, &reg.group_name).await;
+            // Assign to group:
+            // - If group_name looks like a UUID or enrollment_id, try to match by enrollment_id first
+            // - Otherwise match by name
+            // - If no group specified and no token was used (tier 2), assign to "Unassigned"
+            let group_target = if !reg.group_name.is_empty() {
+                reg.group_name.clone()
+            } else if reg.tenant_token.is_empty() {
+                // Tier 2 (tokenless) — auto-assign to "Unassigned"
+                "Unassigned".to_string()
+            } else {
+                String::new()
+            };
+
+            if !group_target.is_empty() {
+                assign_agent_to_group(&state.db, tenant_id, agent_id, &group_target).await;
             }
 
             Some(agent_id)
@@ -654,32 +718,54 @@ async fn handle_agent_registration(
     }
 }
 
-/// Look up a group by name (or create it) and add the agent as a member.
+/// Look up a group by name or enrollment_id (or create it) and add the agent as a member.
 async fn assign_agent_to_group(
     db: &sqlx::PgPool,
     tenant_id: Uuid,
     agent_id: Uuid,
-    group_name: &str,
+    group_identifier: &str,
 ) {
-    // Find or create the group
+    // First try matching by enrollment_id, then by name
     let group_id: Option<(Uuid,)> = sqlx::query_as(
-        r#"
-        INSERT INTO agent_groups (tenant_id, name)
-        VALUES ($1, $2)
-        ON CONFLICT (tenant_id, name) DO UPDATE SET updated_at = NOW()
-        RETURNING id
-        "#,
+        "SELECT id FROM agent_groups WHERE tenant_id = $1 AND (enrollment_id = $2 OR name = $2) LIMIT 1",
     )
     .bind(tenant_id)
-    .bind(group_name)
+    .bind(group_identifier)
     .fetch_optional(db)
     .await
     .ok()
     .flatten();
 
-    let Some((gid,)) = group_id else {
-        tracing::warn!("Failed to find/create group '{}'", group_name);
-        return;
+    let gid = if let Some((id,)) = group_id {
+        id
+    } else {
+        // Group doesn't exist — create it (with auto-generated enrollment_id)
+        let new_id = Uuid::new_v4();
+        let enrollment_id = &new_id.to_string()[..8]; // First 8 chars as short ID
+        let result: Option<(Uuid,)> = sqlx::query_as(
+            r#"
+            INSERT INTO agent_groups (id, tenant_id, name, enrollment_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (tenant_id, name) DO UPDATE SET updated_at = NOW()
+            RETURNING id
+            "#,
+        )
+        .bind(new_id)
+        .bind(tenant_id)
+        .bind(group_identifier)
+        .bind(enrollment_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+
+        match result {
+            Some((id,)) => id,
+            None => {
+                tracing::warn!("Failed to find/create group '{}'", group_identifier);
+                return;
+            }
+        }
     };
 
     // Add agent to group (ignore if already a member)
@@ -691,7 +777,7 @@ async fn assign_agent_to_group(
     .execute(db)
     .await;
 
-    tracing::info!(%agent_id, group = %group_name, "Agent assigned to group");
+    tracing::info!(%agent_id, group = %group_identifier, "Agent assigned to group");
 }
 
 /// Process heartbeat — update DB, store metrics in-memory, and reply.
@@ -741,7 +827,35 @@ async fn handle_heartbeat(
             String::new()
         };
 
+        // Check for agent updates via the cached manifest.
+        // First check if the update policy allows pushing updates right now.
+        let policy = crate::api::update_policy::load_policy(&state.db).await;
+        let update_hint = if policy.should_push_updates() {
+            // Look up agent info from the DB for os/arch
+            let agent_info: Option<(String, String, String)> =
+                sqlx::query_as("SELECT agent_version, os, arch FROM agents WHERE id = $1")
+                    .bind(agent_id)
+                    .fetch_optional(&state.db)
+                    .await
+                    .ok()
+                    .flatten();
+
+            if let Some((version, os, arch)) = agent_info {
+                crate::services::agent_manifest::check_for_update(&version, &os, &arch).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Reply with HeartbeatAck
+        let (update_available, update_version, update_download_url, update_sha256) =
+            match update_hint {
+                Some(hint) => (true, hint.version, hint.download_url, hint.sha256),
+                None => (false, String::new(), String::new(), String::new()),
+            };
+
         let ack = Envelope {
             id: Uuid::new_v4().to_string(),
             session_id: String::new(),
@@ -749,6 +863,10 @@ async fn handle_heartbeat(
             payload: Some(envelope::Payload::HeartbeatAck(HeartbeatAck {
                 interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
                 thumbnail_upload_url: thumbnail_url,
+                update_available,
+                update_version,
+                update_download_url,
+                update_sha256,
             })),
         };
         let mut buf = Vec::new();

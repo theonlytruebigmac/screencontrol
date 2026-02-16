@@ -28,6 +28,8 @@ pub struct AppState {
     pub s3_public: aws_sdk_s3::Client,
     pub config: sc_common::AppConfig,
     pub registry: ws::registry::ConnectionRegistry,
+    /// Unique server instance UUID — agents embed this to bind to this server.
+    pub instance_id: String,
 }
 
 #[tokio::main]
@@ -71,6 +73,13 @@ async fn main() -> anyhow::Result<()> {
     services::s3::ensure_bucket(&s3, "sc-installers").await?;
     tracing::info!("S3/MinIO connected, buckets ready");
 
+    // Load agent update manifest
+    services::agent_manifest::load_manifest().await;
+
+    // Load or generate server instance ID
+    let instance_id = load_instance_id(&db).await;
+    tracing::info!(instance_id = %instance_id, "Server instance identity loaded");
+
     // Build shared state
     let state = Arc::new(AppState {
         db,
@@ -79,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         s3_public,
         config: config.clone(),
         registry: ws::registry::ConnectionRegistry::new(),
+        instance_id,
     });
 
     // Start Redis pub/sub subscribers for multi-instance routing
@@ -109,6 +119,29 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Load the server instance UUID from the `server_config` table.
+/// Falls back to generating a new UUID if the table/row doesn't exist.
+async fn load_instance_id(db: &sqlx::PgPool) -> String {
+    let result: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM server_config WHERE key = 'instance_id'")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+
+    match result {
+        Some((id,)) => id,
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            tracing::warn!(
+                "server_config table missing or no instance_id row — using generated: {}",
+                id
+            );
+            id
+        }
+    }
 }
 
 async fn shutdown_signal() {
