@@ -739,16 +739,9 @@ pub async fn connect_and_run(
                                     tracing::info!(session_id=%sid, "Waiting for new Mutter input handle after monitor switch");
                                     match rx.await {
                                         Ok(mutter_handle) => {
-                                            let (sw, sh) = (
-                                                mutter_handle.stream_width,
-                                                mutter_handle.stream_height,
-                                            );
                                             input_injector = Some(InputInjector::Mutter(
-                                                crate::input::MutterInputInjector::new(
-                                                    mutter_handle.conn,
-                                                    mutter_handle.rd_session,
-                                                    sw,
-                                                    sh,
+                                                crate::input::MutterInputInjector::from_handle(
+                                                    mutter_handle,
                                                 ),
                                             ));
                                         }
