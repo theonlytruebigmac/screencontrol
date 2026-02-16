@@ -27,6 +27,12 @@ pub struct MutterInputHandle {
     pub screen_height: u32,
 }
 
+/// Platform-gated return type for start_capture's input handle.
+#[cfg(target_os = "linux")]
+pub type InputHandleResult = MutterInputHandle;
+#[cfg(not(target_os = "linux"))]
+pub type InputHandleResult = ();
+
 /// Manages screen capture sessions.
 pub struct DesktopCapturer {
     sessions: HashMap<String, CaptureHandle>,
@@ -72,7 +78,7 @@ impl DesktopCapturer {
         session_id: &str,
         monitor_index: u32,
         ws_tx: mpsc::UnboundedSender<Vec<u8>>,
-    ) -> Option<oneshot::Receiver<MutterInputHandle>> {
+    ) -> Option<oneshot::Receiver<InputHandleResult>> {
         let sid = session_id.to_string();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
