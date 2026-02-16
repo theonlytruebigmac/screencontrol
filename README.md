@@ -233,4 +233,4 @@ cd web && npm run lint
 | `NEXT_PUBLIC_WS_URL` | Frontend | WS URL for browser | `ws://.../ws` |
 
 ## License
-Proprietary — All rights reserved.
+Distributed under the MIT License. See `LICENSE` for more information.
