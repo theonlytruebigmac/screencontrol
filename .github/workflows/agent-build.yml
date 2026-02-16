@@ -18,6 +18,14 @@ jobs:
       OSXCROSS_ROOT: /tmp/osxcross
 
     steps:
+      - name: Install Git LFS
+        run: |
+          if ! command -v git-lfs &>/dev/null; then
+            curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
+            sudo apt-get install -y git-lfs
+          fi
+          git lfs install
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
