@@ -465,6 +465,8 @@ fn install_launchd(exe_path: &PathBuf) -> anyhow::Result<()> {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>SessionCreate</key>
+    <true/>
     <key>StandardOutPath</key>
     <string>/var/log/screencontrol-agent.log</string>
     <key>StandardErrorPath</key>

@@ -38,6 +38,7 @@ enum SetupEvent {
 #[cfg(target_os = "macos")]
 extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
     fn AXIsProcessTrusted() -> bool;
 }
 
@@ -61,14 +62,56 @@ fn check_full_disk_access() -> bool {
 }
 
 // ── macOS permission checks ──────────────────────────────────
+// IMPORTANT: We query the system TCC database for the daemon's bundle ID
+// (`com.screencontrol.agent`) instead of using process-local APIs like
+// `CGPreflightScreenCaptureAccess()`, which only check the setup app's
+// own permissions and would incorrectly report "granted".
+
+const DAEMON_BUNDLE_ID: &str = "com.screencontrol.agent";
+
+/// Query the system TCC database for a given service and bundle ID.
+/// Returns true if auth_value == 2 (allowed).
+#[cfg(target_os = "macos")]
+fn check_tcc_for_daemon(service: &str) -> bool {
+    use std::process::Command;
+    // The system TCC database is at /Library/Application Support/com.apple.TCC/TCC.db
+    // We need root to read it, but the setup app runs after `sudo sc-agent install`
+    // so it may have inherited root. If not, fall back to process-local check.
+    let output = Command::new("sqlite3")
+        .args([
+            "/Library/Application Support/com.apple.TCC/TCC.db",
+            &format!(
+                "SELECT auth_value FROM access WHERE service='{}' AND client='{}' AND auth_value=2;",
+                service, DAEMON_BUNDLE_ID
+            ),
+        ])
+        .output();
+    match output {
+        Ok(out) => {
+            let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            result == "2"
+        }
+        Err(_) => false,
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn check_screen_recording() -> bool {
+    // First check the daemon's TCC entry directly
+    if check_tcc_for_daemon("kTCCServiceScreenCapture") {
+        return true;
+    }
+    // Fall back to process-local check (less reliable for daemon)
     unsafe { CGPreflightScreenCaptureAccess() }
 }
 
 #[cfg(target_os = "macos")]
 fn check_accessibility() -> bool {
+    // Check the daemon's TCC entry directly
+    if check_tcc_for_daemon("kTCCServiceAccessibility") {
+        return true;
+    }
+    // Fall back to process-local check
     unsafe { AXIsProcessTrusted() }
 }
 
@@ -76,9 +119,12 @@ fn check_accessibility() -> bool {
 /// AVAuthorizationStatus: 0=notDetermined, 1=restricted, 2=denied, 3=authorized
 #[cfg(target_os = "macos")]
 fn check_microphone() -> bool {
+    // Check TCC database for the daemon
+    if check_tcc_for_daemon("kTCCServiceMicrophone") {
+        return true;
+    }
+    // Fall back to osascript check for current process
     use std::process::Command;
-    // Use osascript to query AVCaptureDevice authorization status
-    // This avoids needing to link AVFoundation directly
     let output = Command::new("osascript")
         .args(["-e", "use framework \"AVFoundation\"", "-e",
             "set status to (current application's AVCaptureDevice's authorizationStatusForMediaType:(current application's AVMediaTypeAudio)) as integer",
@@ -97,9 +143,13 @@ fn check_microphone() -> bool {
 /// Reading ~/Library/Application Support/com.apple.TCC/TCC.db requires FDA.
 #[cfg(target_os = "macos")]
 fn check_full_disk_access() -> bool {
+    // Check TCC database entry for the daemon
+    if check_tcc_for_daemon("kTCCServiceSystemPolicyAllFiles") {
+        return true;
+    }
+    // Fall back to probe
     if let Some(home) = dirs::home_dir() {
         let tcc_db = home.join("Library/Application Support/com.apple.TCC/TCC.db");
-        // If we can open the file for reading, we have FDA
         std::fs::File::open(&tcc_db).is_ok()
     } else {
         false
@@ -240,6 +290,31 @@ pub fn run_setup() -> ! {
                 #[cfg(target_os = "macos")]
                 {
                     match category.as_str() {
+                        "screen_recording" => {
+                            // Trigger the native Screen Recording consent dialog
+                            // This shows macOS's "X would like to record..." prompt
+                            unsafe { CGRequestScreenCaptureAccess(); }
+                            // Also open System Settings so the user can find ScreenControl
+                            let _ = std::process::Command::new("open")
+                                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+                                .spawn();
+                        }
+                        "accessibility" => {
+                            // Insert a TCC entry for the daemon's bundle ID to make it
+                            // appear in System Settings, then open the panel for the user
+                            let _ = std::process::Command::new("sqlite3")
+                                .args([
+                                    "/Library/Application Support/com.apple.TCC/TCC.db",
+                                    &format!(
+                                        "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, flags) VALUES ('kTCCServiceAccessibility', '{}', 0, 2, 0, 1, 0);",
+                                        DAEMON_BUNDLE_ID
+                                    ),
+                                ])
+                                .output();
+                            let _ = std::process::Command::new("open")
+                                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                                .spawn();
+                        }
                         "microphone" => {
                             // Trigger the native microphone permission dialog.
                             // The app must call requestAccess() to appear in the TCC panel.
@@ -250,21 +325,12 @@ pub fn run_setup() -> ! {
                                 ])
                                 .spawn();
                         }
-                        _ => {
-                            let url = match category.as_str() {
-                                "screen_recording" => {
-                                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
-                                }
-                                "accessibility" => {
-                                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-                                }
-                                "full_disk_access" => {
-                                    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
-                                }
-                                _ => return,
-                            };
-                            let _ = std::process::Command::new("open").arg(url).spawn();
+                        "full_disk_access" => {
+                            let _ = std::process::Command::new("open")
+                                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                                .spawn();
                         }
+                        _ => {}
                     }
                 }
                 #[cfg(not(target_os = "macos"))]

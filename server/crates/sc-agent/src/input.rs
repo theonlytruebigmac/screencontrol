@@ -15,6 +15,9 @@ use sc_protocol::input_event;
 pub enum InputInjector {
     #[cfg(target_os = "linux")]
     Mutter(MutterInputInjector),
+    #[cfg(target_os = "macos")]
+    CoreGraphics(CoreGraphicsInputInjector),
+    #[allow(dead_code)]
     Enigo(EnigoInputInjector),
 }
 
@@ -24,6 +27,8 @@ impl InputInjector {
         match self {
             #[cfg(target_os = "linux")]
             InputInjector::Mutter(m) => m.handle_event(event),
+            #[cfg(target_os = "macos")]
+            InputInjector::CoreGraphics(cg) => cg.handle_event(event),
             InputInjector::Enigo(e) => e.handle_event(event),
         }
     }
@@ -295,6 +300,327 @@ fn map_web_keycode_to_evdev(web_code: u32) -> Option<u32> {
     Some(evdev)
 }
 
+// ─── CoreGraphics Backend (macOS native) ─────────────────────────────
+
+#[cfg(target_os = "macos")]
+pub struct CoreGraphicsInputInjector {
+    screen_width: u32,
+    screen_height: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+mod cg_ffi {
+    use std::ffi::c_void;
+
+    pub type CGEventRef = *const c_void;
+    pub type CGEventSourceRef = *const c_void;
+
+    // CGEventType values
+    pub const K_CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
+    pub const K_CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
+    pub const K_CG_EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
+    pub const K_CG_EVENT_RIGHT_MOUSE_UP: u32 = 4;
+    pub const K_CG_EVENT_MOUSE_MOVED: u32 = 5;
+    pub const K_CG_EVENT_LEFT_MOUSE_DRAGGED: u32 = 6;
+    pub const K_CG_EVENT_RIGHT_MOUSE_DRAGGED: u32 = 7;
+    pub const K_CG_EVENT_KEY_DOWN: u32 = 10;
+    pub const K_CG_EVENT_KEY_UP: u32 = 11;
+    pub const K_CG_EVENT_SCROLL_WHEEL: u32 = 22;
+    pub const K_CG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
+    pub const K_CG_EVENT_OTHER_MOUSE_UP: u32 = 26;
+
+    // CGEventTapLocation
+    pub const K_CG_HID_EVENT_TAP: u32 = 0;
+
+    // CGMouseButton
+    pub const K_CG_MOUSE_BUTTON_LEFT: u32 = 0;
+    pub const K_CG_MOUSE_BUTTON_RIGHT: u32 = 1;
+    pub const K_CG_MOUSE_BUTTON_CENTER: u32 = 2;
+
+    // CGScrollEventUnit
+    pub const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct CGPoint {
+        pub x: f64,
+        pub y: f64,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        pub fn CGEventCreateMouseEvent(
+            source: CGEventSourceRef,
+            mouse_type: u32,
+            mouse_cursor_position: CGPoint,
+            mouse_button: u32,
+        ) -> CGEventRef;
+
+        pub fn CGEventCreateKeyboardEvent(
+            source: CGEventSourceRef,
+            virtual_key: u16,
+            key_down: bool,
+        ) -> CGEventRef;
+
+        pub fn CGEventCreateScrollWheelEvent2(
+            source: CGEventSourceRef,
+            units: u32,
+            wheel_count: u32,
+            wheel1: i32,
+            wheel2: i32,
+            wheel3: i32,
+        ) -> CGEventRef;
+
+        pub fn CGEventPost(tap: u32, event: CGEventRef);
+
+        pub fn CFRelease(cf: *const c_void);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl CoreGraphicsInputInjector {
+    pub fn new(screen_width: u32, screen_height: u32) -> Self {
+        tracing::info!(
+            screen_width,
+            screen_height,
+            "Creating CoreGraphicsInputInjector (native CG events)"
+        );
+        Self {
+            screen_width,
+            screen_height,
+        }
+    }
+
+    pub fn handle_event(&mut self, event: &sc_protocol::InputEvent) {
+        match &event.event {
+            Some(input_event::Event::MouseMove(mv)) => {
+                let x = mv.x * self.screen_width as f64;
+                let y = mv.y * self.screen_height as f64;
+                self.post_mouse_move(x, y);
+            }
+            Some(input_event::Event::MouseButton(btn)) => {
+                let x = btn.x * self.screen_width as f64;
+                let y = btn.y * self.screen_height as f64;
+                self.post_mouse_button(x, y, btn.button, btn.pressed);
+            }
+            Some(input_event::Event::MouseScroll(scroll)) => {
+                let dy = if scroll.delta_y.abs() > 0.01 {
+                    -(scroll.delta_y * 3.0) as i32 // Inverted: positive deltaY = scroll down
+                } else {
+                    0
+                };
+                let dx = if scroll.delta_x.abs() > 0.01 {
+                    (scroll.delta_x * 3.0) as i32
+                } else {
+                    0
+                };
+                if dy != 0 || dx != 0 {
+                    self.post_scroll(dy, dx);
+                }
+            }
+            Some(input_event::Event::KeyEvent(key)) => {
+                if let Some(vk) = map_web_keycode_to_macos(key.key_code) {
+                    self.post_key(vk, key.pressed);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn post_mouse_move(&self, x: f64, y: f64) {
+        unsafe {
+            let point = cg_ffi::CGPoint { x, y };
+            let event = cg_ffi::CGEventCreateMouseEvent(
+                std::ptr::null(),
+                cg_ffi::K_CG_EVENT_MOUSE_MOVED,
+                point,
+                cg_ffi::K_CG_MOUSE_BUTTON_LEFT,
+            );
+            if !event.is_null() {
+                cg_ffi::CGEventPost(cg_ffi::K_CG_HID_EVENT_TAP, event);
+                cg_ffi::CFRelease(event);
+            }
+        }
+    }
+
+    fn post_mouse_button(&self, x: f64, y: f64, button: u32, pressed: bool) {
+        unsafe {
+            let point = cg_ffi::CGPoint { x, y };
+            let (event_type, cg_button) = match (button, pressed) {
+                (0, true) => (
+                    cg_ffi::K_CG_EVENT_LEFT_MOUSE_DOWN,
+                    cg_ffi::K_CG_MOUSE_BUTTON_LEFT,
+                ),
+                (0, false) => (
+                    cg_ffi::K_CG_EVENT_LEFT_MOUSE_UP,
+                    cg_ffi::K_CG_MOUSE_BUTTON_LEFT,
+                ),
+                (1, true) => (
+                    cg_ffi::K_CG_EVENT_OTHER_MOUSE_DOWN,
+                    cg_ffi::K_CG_MOUSE_BUTTON_CENTER,
+                ),
+                (1, false) => (
+                    cg_ffi::K_CG_EVENT_OTHER_MOUSE_UP,
+                    cg_ffi::K_CG_MOUSE_BUTTON_CENTER,
+                ),
+                (2, true) => (
+                    cg_ffi::K_CG_EVENT_RIGHT_MOUSE_DOWN,
+                    cg_ffi::K_CG_MOUSE_BUTTON_RIGHT,
+                ),
+                (2, false) => (
+                    cg_ffi::K_CG_EVENT_RIGHT_MOUSE_UP,
+                    cg_ffi::K_CG_MOUSE_BUTTON_RIGHT,
+                ),
+                _ => (
+                    cg_ffi::K_CG_EVENT_LEFT_MOUSE_DOWN,
+                    cg_ffi::K_CG_MOUSE_BUTTON_LEFT,
+                ),
+            };
+            // Move to position first
+            let move_event = cg_ffi::CGEventCreateMouseEvent(
+                std::ptr::null(),
+                cg_ffi::K_CG_EVENT_MOUSE_MOVED,
+                point,
+                cg_button,
+            );
+            if !move_event.is_null() {
+                cg_ffi::CGEventPost(cg_ffi::K_CG_HID_EVENT_TAP, move_event);
+                cg_ffi::CFRelease(move_event);
+            }
+            // Then click
+            let click_event =
+                cg_ffi::CGEventCreateMouseEvent(std::ptr::null(), event_type, point, cg_button);
+            if !click_event.is_null() {
+                cg_ffi::CGEventPost(cg_ffi::K_CG_HID_EVENT_TAP, click_event);
+                cg_ffi::CFRelease(click_event);
+            }
+        }
+    }
+
+    fn post_scroll(&self, dy: i32, dx: i32) {
+        unsafe {
+            let event = cg_ffi::CGEventCreateScrollWheelEvent2(
+                std::ptr::null(),
+                cg_ffi::K_CG_SCROLL_EVENT_UNIT_LINE,
+                2, // wheelCount
+                dy,
+                dx,
+                0,
+            );
+            if !event.is_null() {
+                cg_ffi::CGEventPost(cg_ffi::K_CG_HID_EVENT_TAP, event);
+                cg_ffi::CFRelease(event);
+            }
+        }
+    }
+
+    fn post_key(&self, virtual_key: u16, pressed: bool) {
+        unsafe {
+            let event = cg_ffi::CGEventCreateKeyboardEvent(std::ptr::null(), virtual_key, pressed);
+            if !event.is_null() {
+                cg_ffi::CGEventPost(cg_ffi::K_CG_HID_EVENT_TAP, event);
+                cg_ffi::CFRelease(event);
+            }
+        }
+    }
+}
+
+/// Map web KeyboardEvent.keyCode to macOS virtual key code.
+#[cfg(target_os = "macos")]
+fn map_web_keycode_to_macos(web_code: u32) -> Option<u16> {
+    let vk: u16 = match web_code {
+        // Letters A-Z
+        65 => 0x00, // kVK_ANSI_A
+        66 => 0x0B, // kVK_ANSI_B
+        67 => 0x08, // kVK_ANSI_C
+        68 => 0x02, // kVK_ANSI_D
+        69 => 0x0E, // kVK_ANSI_E
+        70 => 0x03, // kVK_ANSI_F
+        71 => 0x05, // kVK_ANSI_G
+        72 => 0x04, // kVK_ANSI_H
+        73 => 0x22, // kVK_ANSI_I
+        74 => 0x26, // kVK_ANSI_J
+        75 => 0x28, // kVK_ANSI_K
+        76 => 0x25, // kVK_ANSI_L
+        77 => 0x2E, // kVK_ANSI_M
+        78 => 0x2D, // kVK_ANSI_N
+        79 => 0x1F, // kVK_ANSI_O
+        80 => 0x23, // kVK_ANSI_P
+        81 => 0x0C, // kVK_ANSI_Q
+        82 => 0x0F, // kVK_ANSI_R
+        83 => 0x01, // kVK_ANSI_S
+        84 => 0x11, // kVK_ANSI_T
+        85 => 0x20, // kVK_ANSI_U
+        86 => 0x09, // kVK_ANSI_V
+        87 => 0x0D, // kVK_ANSI_W
+        88 => 0x07, // kVK_ANSI_X
+        89 => 0x10, // kVK_ANSI_Y
+        90 => 0x06, // kVK_ANSI_Z
+        // Digits 0-9
+        48 => 0x1D, // kVK_ANSI_0
+        49 => 0x12, // kVK_ANSI_1
+        50 => 0x13, // kVK_ANSI_2
+        51 => 0x14, // kVK_ANSI_3
+        52 => 0x15, // kVK_ANSI_4
+        53 => 0x17, // kVK_ANSI_5
+        54 => 0x16, // kVK_ANSI_6
+        55 => 0x1A, // kVK_ANSI_7
+        56 => 0x1C, // kVK_ANSI_8
+        57 => 0x19, // kVK_ANSI_9
+        // Function keys
+        112 => 0x7A, // kVK_F1
+        113 => 0x78, // kVK_F2
+        114 => 0x63, // kVK_F3
+        115 => 0x76, // kVK_F4
+        116 => 0x60, // kVK_F5
+        117 => 0x61, // kVK_F6
+        118 => 0x62, // kVK_F7
+        119 => 0x64, // kVK_F8
+        120 => 0x65, // kVK_F9
+        121 => 0x6D, // kVK_F10
+        122 => 0x67, // kVK_F11
+        123 => 0x6F, // kVK_F12
+        // Special keys
+        8 => 0x33,  // kVK_Delete (Backspace)
+        9 => 0x30,  // kVK_Tab
+        13 => 0x24, // kVK_Return
+        16 => 0x38, // kVK_Shift
+        17 => 0x3B, // kVK_Control
+        18 => 0x3A, // kVK_Option (Alt)
+        20 => 0x39, // kVK_CapsLock
+        27 => 0x35, // kVK_Escape
+        32 => 0x31, // kVK_Space
+        33 => 0x74, // kVK_PageUp
+        34 => 0x79, // kVK_PageDown
+        35 => 0x77, // kVK_End
+        36 => 0x73, // kVK_Home
+        37 => 0x7B, // kVK_LeftArrow
+        38 => 0x7E, // kVK_UpArrow
+        39 => 0x7C, // kVK_RightArrow
+        40 => 0x7D, // kVK_DownArrow
+        46 => 0x75, // kVK_ForwardDelete
+        91 => 0x37, // kVK_Command (Meta/Super)
+        // Punctuation
+        186 => 0x29, // kVK_ANSI_Semicolon
+        187 => 0x18, // kVK_ANSI_Equal
+        188 => 0x2B, // kVK_ANSI_Comma
+        189 => 0x1B, // kVK_ANSI_Minus
+        190 => 0x2F, // kVK_ANSI_Period
+        191 => 0x2C, // kVK_ANSI_Slash
+        192 => 0x32, // kVK_ANSI_Grave
+        219 => 0x21, // kVK_ANSI_LeftBracket
+        220 => 0x2A, // kVK_ANSI_Backslash
+        221 => 0x1E, // kVK_ANSI_RightBracket
+        222 => 0x27, // kVK_ANSI_Quote
+        _ => {
+            tracing::debug!("Unmapped web keycode for macOS: {}", web_code);
+            return None;
+        }
+    };
+    Some(vk)
+}
+
 // ─── Enigo Backend (fallback for X11 / macOS / Windows) ────────────────
 
 pub struct EnigoInputInjector {
@@ -304,6 +630,7 @@ pub struct EnigoInputInjector {
 }
 
 impl EnigoInputInjector {
+    #[allow(dead_code)]
     pub fn new(screen_width: u32, screen_height: u32) -> anyhow::Result<Self> {
         use enigo::Settings;
 

@@ -519,7 +519,19 @@ pub async fn connect_and_run(
                                         }
                                     }
 
-                                    #[cfg(not(target_os = "linux"))]
+                                    #[cfg(target_os = "macos")]
+                                    {
+                                        let _ = input_handle_rx; // suppress unused warning
+                                        let (sw, sh) = crate::screen::get_total_screen_size();
+                                        let cg_inj =
+                                            crate::input::CoreGraphicsInputInjector::new(sw, sh);
+                                        input_injector = Some(InputInjector::CoreGraphics(cg_inj));
+                                        tracing::info!(
+                                            "CoreGraphicsInputInjector created for macOS"
+                                        );
+                                    }
+
+                                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                                     {
                                         let _ = input_handle_rx; // suppress unused warning
                                         let (sw, sh) = crate::screen::get_total_screen_size();
