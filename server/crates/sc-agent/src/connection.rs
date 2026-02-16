@@ -97,6 +97,10 @@ pub async fn connect_and_run(
     let hb_agent_id = agent_id.to_string();
     let hb_sys = Arc::clone(&sys);
     let heartbeat_handle = tokio::spawn(async move {
+        tracing::info!(
+            "Heartbeat task started (interval: {}s)",
+            hb_interval_clone.load(Ordering::Relaxed)
+        );
         loop {
             let secs = hb_interval_clone.load(Ordering::Relaxed) as u64;
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
@@ -126,26 +130,37 @@ pub async fn connect_and_run(
             let mut buf = Vec::new();
             if hb_envelope.encode(&mut buf).is_ok() {
                 if heartbeat_tx.send(buf).is_err() {
+                    tracing::warn!("Heartbeat channel closed — writer task gone");
                     break;
                 }
-                tracing::debug!(
-                    "Heartbeat sent (cpu={:.1}%, mem={}/{})",
+                tracing::info!(
+                    "Heartbeat queued (cpu={:.1}%, mem={}/{})",
                     metrics.cpu_usage,
                     metrics.memory_used,
                     metrics.memory_total
                 );
+            } else {
+                tracing::error!("Heartbeat encode failed");
             }
         }
+        tracing::warn!("Heartbeat task exiting");
     });
 
     // ── Writer task (drains tx channel → WS) ─────────────────
 
     let writer_handle = tokio::spawn(async move {
+        tracing::info!("Writer task started");
         while let Some(data) = rx.recv().await {
-            if ws_write.send(Message::Binary(data)).await.is_err() {
-                break;
+            let len = data.len();
+            match ws_write.send(Message::Binary(data)).await {
+                Ok(_) => tracing::debug!("Writer: sent {} bytes", len),
+                Err(e) => {
+                    tracing::error!("Writer: WS send failed: {}", e);
+                    break;
+                }
             }
         }
+        tracing::warn!("Writer task exiting");
     });
 
     // Shared session ID for chat replies — updated when we receive a ChatMessage

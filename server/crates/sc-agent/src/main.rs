@@ -48,11 +48,13 @@ fn main() -> anyhow::Result<()> {
         "install" => {
             let config = parse_install_flags(&args[2..])?;
             service::install(config)?;
-            // Auto-launch setup unless --no-setup or --silent was passed
-            let silent = args.iter().any(|a| a == "--silent");
-            if !silent && !args.iter().any(|a| a == "--no-setup") {
-                println!("\nLaunching permission setup...");
-                setup::run_setup();
+            // Auto-launch setup on macOS only (TCC permissions)
+            if cfg!(target_os = "macos") {
+                let silent = args.iter().any(|a| a == "--silent");
+                if !silent && !args.iter().any(|a| a == "--no-setup") {
+                    println!("\nLaunching permission setup...");
+                    setup::run_setup();
+                }
             }
             return Ok(());
         }

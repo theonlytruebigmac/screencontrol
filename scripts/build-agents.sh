@@ -156,6 +156,7 @@ for arg in "$@"; do
 done
 
 if [ "$NATIVE_ONLY" = true ]; then
+    BUILD_CMD="cargo"  # Force cargo for native builds (avoid cross Docker glibc mismatch)
     CURRENT_TARGET=$(rustc -vV | grep host | sed 's/host: //')
     for i in "${!TARGET_TRIPLES[@]}"; do
         if [ "${TARGET_TRIPLES[$i]}" = "$CURRENT_TARGET" ]; then
