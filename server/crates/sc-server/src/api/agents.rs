@@ -277,11 +277,13 @@ async fn delete_agent(
     Query(params): Query<DeleteAgentQuery>,
 ) -> AppResult<StatusCode> {
     // Verify agent exists
-    let _agent: AgentRow = sqlx::query_as("SELECT * FROM agents WHERE id = $1")
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1)")
         .bind(id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Agent not found".into()))?;
+        .fetch_one(&state.db)
+        .await?;
+    if !exists {
+        return Err(AppError::NotFound("Agent not found".into()));
+    }
 
     // If uninstall requested and agent is online, send uninstall command
     if params.uninstall && state.registry.agents.contains_key(&id) {
