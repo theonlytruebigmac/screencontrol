@@ -100,13 +100,15 @@ export type EnvelopePayload =
     | { type: "terminal_resize"; cols: number; rows: number }
     | { type: "session_offer"; sdp: string; sessionType: number }
     | { type: "session_end"; reason: string }
-    | { type: "desktop_frame"; width: number; height: number; data: Uint8Array; sequence: number; quality: number }
+    | { type: "desktop_frame"; width: number; height: number; data: Uint8Array; sequence: number; quality: number; codec: number; isKeyframe: boolean }
     | { type: "screen_info"; monitors: MonitorInfo[]; activeMonitor: number }
     | { type: "chat_message"; senderId: string; senderName: string; content: string }
     | { type: "command_response"; exitCode: number; stdout: string; stderr: string; timedOut: boolean }
     | { type: "file_list"; path: string; entries: FileEntryInfo[] }
     | { type: "file_transfer_ack"; transferId: string; accepted: boolean; presignedUrl: string; message: string }
     | { type: "consent_response"; granted: boolean; reason: string }
+    | { type: "clipboard_data"; text: string; mimeType: string }
+    | { type: "pong"; timestamp: number }
     | { type: "unknown"; fieldNumber: number };
 
 export interface FileEntryInfo {
@@ -412,6 +414,8 @@ export function decodeEnvelope(data: Uint8Array): DecodedEnvelope | null {
                     case 30: payload = decodeTerminalData(fieldData); break;
                     case 31: payload = decodeTerminalResize(fieldData); break;
                     case 41: payload = decodeScreenInfo(fieldData); break;
+                    case 42: payload = decodeClipboardData(fieldData); break;
+                    case 46: payload = decodePong(fieldData); break;
                     case 60: payload = decodeChatMessage(fieldData); break;
                     case 71: payload = decodeCommandResponse(fieldData); break;
                     case 80: payload = decodeDesktopFrame(fieldData); break;
@@ -586,15 +590,71 @@ function decodeConsentResponse(data: Uint8Array): EnvelopePayload {
 }
 
 /**
+ * Decode a ClipboardData message.
+ *
+ * ClipboardData { string text = 1; string mime_type = 2; }
+ */
+function decodeClipboardData(data: Uint8Array): EnvelopePayload {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    let offset = 0;
+    let text = "";
+    let mimeType = "text/plain";
+
+    while (offset < data.length) {
+        const [tag, newOffset] = decodeVarint(view, offset);
+        offset = newOffset;
+        const fieldNumber = tag >>> 3;
+        const wireType = tag & 0x7;
+
+        if (wireType === 2) {
+            const [len, lenOffset] = decodeVarint(view, offset);
+            offset = lenOffset;
+            const str = new TextDecoder().decode(data.slice(offset, offset + len));
+            offset += len;
+            if (fieldNumber === 1) text = str;
+            else if (fieldNumber === 2) mimeType = str;
+        } else if (wireType === 0) {
+            const [, vOffset] = decodeVarint(view, offset);
+            offset = vOffset;
+        } else {
+            break;
+        }
+    }
+
+    return { type: "clipboard_data", text, mimeType };
+}
+
+/** Encode an Envelope with a ClipboardData payload (field 42). */
+export function encodeClipboardData(sessionId: string, text: string): Uint8Array {
+    // Encode ClipboardData: string text = 1; string mime_type = 2;
+    const clipBuf: number[] = [];
+    encodeString(1, text, clipBuf);
+    encodeString(2, "text/plain", clipBuf);
+    const clipBytes = new Uint8Array(clipBuf);
+
+    // Wrap in Envelope (field 42 = ClipboardData)
+    const buf: number[] = [];
+    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(2, sessionId, buf);
+    encodeLengthDelimited(42, clipBytes, buf);
+    return new Uint8Array(buf);
+}
+
+/**
  * Decode a DesktopFrame message.
  *
- * DesktopFrame { uint32 width=1; uint32 height=2; bytes data=3;
- *                uint32 sequence=4; uint32 quality=5; }
+ * DesktopFrame { uint32 width = 1; uint32 height = 2; bytes data = 3;
+ *   uint32 sequence = 4; uint32 quality = 5;
+ *   FrameCodec codec = 6; bool is_keyframe = 7;
+ * }
+ *
+ * FrameCodec: 0 = JPEG, 1 = H264
  */
 function decodeDesktopFrame(data: Uint8Array): EnvelopePayload {
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
     let offset = 0;
     let width = 0, height = 0, sequence = 0, quality = 0;
+    let codec = 0, isKeyframe = false;
     let frameData = new Uint8Array(0);
 
     while (offset < data.length) {
@@ -610,6 +670,8 @@ function decodeDesktopFrame(data: Uint8Array): EnvelopePayload {
             else if (fieldNumber === 2) height = val;
             else if (fieldNumber === 4) sequence = val;
             else if (fieldNumber === 5) quality = val;
+            else if (fieldNumber === 6) codec = val;
+            else if (fieldNumber === 7) isKeyframe = val !== 0;
         } else if (wireType === 2) {
             const [len, lenOffset] = decodeVarint(view, offset);
             offset = lenOffset;
@@ -622,7 +684,7 @@ function decodeDesktopFrame(data: Uint8Array): EnvelopePayload {
         }
     }
 
-    return { type: "desktop_frame", width, height, data: frameData, sequence, quality };
+    return { type: "desktop_frame", width, height, data: frameData, sequence, quality, codec, isKeyframe };
 }
 
 /**
@@ -905,4 +967,74 @@ function decodeFileTransferAck(data: Uint8Array): EnvelopePayload {
     }
 
     return { type: "file_transfer_ack", transferId, accepted, presignedUrl, message };
+}
+
+// ─── Monitor Switch ─────────────────────────────────────────
+
+/** Encode a MonitorSwitch envelope (field 43). */
+export function encodeMonitorSwitch(sessionId: string, monitorIndex: number): Uint8Array {
+    const inner: number[] = [];
+    encodeVarintField(1, monitorIndex, inner);
+    const innerBytes = new Uint8Array(inner);
+
+    const buf: number[] = [];
+    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(2, sessionId, buf);
+    encodeLengthDelimited(43, innerBytes, buf);
+    return new Uint8Array(buf);
+}
+
+// ─── Quality Settings ───────────────────────────────────────
+
+/** Encode a QualitySettings envelope (field 44). */
+export function encodeQualitySettings(sessionId: string, quality: number, maxFps: number): Uint8Array {
+    const inner: number[] = [];
+    if (quality > 0) encodeVarintField(1, quality, inner);
+    if (maxFps > 0) encodeVarintField(2, maxFps, inner);
+    const innerBytes = new Uint8Array(inner);
+
+    const buf: number[] = [];
+    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(2, sessionId, buf);
+    encodeLengthDelimited(44, innerBytes, buf);
+    return new Uint8Array(buf);
+}
+
+// ─── Ping / Pong ────────────────────────────────────────────
+
+/** Encode a Ping envelope (field 45). */
+export function encodePing(sessionId: string, timestamp: number): Uint8Array {
+    const inner: number[] = [];
+    encodeVarintField(1, timestamp, inner);
+    const innerBytes = new Uint8Array(inner);
+
+    const buf: number[] = [];
+    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(2, sessionId, buf);
+    encodeLengthDelimited(45, innerBytes, buf);
+    return new Uint8Array(buf);
+}
+
+/** Decode a Pong message. */
+function decodePong(data: Uint8Array): EnvelopePayload {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    let offset = 0;
+    let timestamp = 0;
+
+    while (offset < data.length) {
+        const [tag, newOffset] = decodeVarint(view, offset);
+        offset = newOffset;
+        const fieldNumber = tag >>> 3;
+        const wireType = tag & 0x7;
+
+        if (wireType === 0) {
+            const [val, vOffset] = decodeVarint(view, offset);
+            offset = vOffset;
+            if (fieldNumber === 1) timestamp = val;
+        } else {
+            break;
+        }
+    }
+
+    return { type: "pong", timestamp };
 }

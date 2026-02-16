@@ -48,6 +48,7 @@ pub async fn connect_and_run(
     let mut terminal_mgr = TerminalManager::new();
     let mut desktop_capturer = DesktopCapturer::new();
     let mut input_injector: Option<InputInjector> = None;
+    let mut clipboard_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
 
     // Derive HTTP base URL from WS URL (e.g. ws://host:8080/ws/agent → http://host:8080)
     let http_base = server_url
@@ -535,10 +536,45 @@ pub async fn connect_and_run(
                                     {
                                         let _ = input_handle_rx; // suppress unused warning
                                         let (sw, sh) = crate::screen::get_total_screen_size();
-                                        if let Ok(inj) =
-                                            crate::input::EnigoInputInjector::new(sw, sh)
+
+                                        // Prefer native Win32 SendInput on Windows
+                                        #[cfg(target_os = "windows")]
                                         {
-                                            input_injector = Some(InputInjector::Enigo(inj));
+                                            let inj = crate::input::Win32InputInjector::new(sw, sh);
+                                            input_injector = Some(InputInjector::Win32(inj));
+                                            tracing::info!("Win32InputInjector (SendInput) created for Windows");
+                                        }
+
+                                        // Non-Windows non-Linux non-Mac: use Enigo
+                                        #[cfg(not(target_os = "windows"))]
+                                        {
+                                            if let Ok(inj) =
+                                                crate::input::EnigoInputInjector::new(sw, sh)
+                                            {
+                                                input_injector = Some(InputInjector::Enigo(inj));
+                                            }
+                                        }
+                                    }
+
+                                    // Configure multi-monitor geometry on the injector
+                                    if let Some(ref mut inj) = input_injector {
+                                        let monitors = crate::screen::enumerate_monitors();
+                                        let (total_w, total_h) =
+                                            crate::screen::get_total_screen_size();
+                                        if let Some(mon) =
+                                            monitors.iter().find(|m| m.index == req.monitor_index)
+                                        {
+                                            let geom = crate::input::MonitorGeometry::for_monitor(
+                                                mon.x, mon.y, mon.width, mon.height, total_w,
+                                                total_h,
+                                            );
+                                            inj.set_monitor_geometry(geom);
+                                        } else {
+                                            // Fallback: treat the whole desktop as a single monitor
+                                            let geom = crate::input::MonitorGeometry::single(
+                                                total_w, total_h,
+                                            );
+                                            inj.set_monitor_geometry(geom);
                                         }
                                     }
 
@@ -557,6 +593,47 @@ pub async fn connect_and_run(
                                     if offer.encode(&mut buf).is_ok() {
                                         let _ = tx.send(buf);
                                     }
+
+                                    // Start clipboard polling for this desktop session
+                                    let (cancel_tx, cancel_rx) =
+                                        tokio::sync::oneshot::channel::<()>();
+                                    clipboard_cancel = Some(cancel_tx);
+                                    let clip_tx = tx.clone();
+                                    let clip_session = session_id.clone();
+                                    tokio::spawn(async move {
+                                        let mut watcher = crate::clipboard::ClipboardWatcher::new();
+                                        let mut interval = tokio::time::interval(
+                                            std::time::Duration::from_millis(500),
+                                        );
+                                        tokio::pin!(let cancel = cancel_rx;);
+                                        loop {
+                                            tokio::select! {
+                                                _ = interval.tick() => {
+                                                    if let Some(text) = watcher.poll_change() {
+                                                        let env = Envelope {
+                                                            id: Uuid::new_v4().to_string(),
+                                                            session_id: clip_session.clone(),
+                                                            timestamp: None,
+                                                            payload: Some(envelope::Payload::ClipboardData(
+                                                                sc_protocol::ClipboardData {
+                                                                    text,
+                                                                    mime_type: "text/plain".to_string(),
+                                                                },
+                                                            )),
+                                                        };
+                                                        let mut buf = Vec::new();
+                                                        if env.encode(&mut buf).is_ok() {
+                                                            let _ = clip_tx.send(buf);
+                                                        }
+                                                    }
+                                                }
+                                                _ = &mut cancel => {
+                                                    tracing::debug!("Clipboard polling cancelled");
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    });
                                 } else if req.session_type == 3
                                 /* SESSION_TYPE_FILE_TRANSFER */
                                 {
@@ -593,7 +670,15 @@ pub async fn connect_and_run(
                                 tracing::info!("Session ended: {}", end.reason);
                                 terminal_mgr.close_session(&session_id);
                                 desktop_capturer.stop_capture(&session_id);
+                                // Release stuck modifier keys before dropping the injector
+                                if let Some(ref mut inj) = input_injector {
+                                    inj.release_all_keys();
+                                }
                                 input_injector = None;
+                                // Stop clipboard polling
+                                if let Some(cancel) = clipboard_cancel.take() {
+                                    let _ = cancel.send(());
+                                }
                                 tracing::info!(
                                     "Input injector cleared for session: {}",
                                     session_id
@@ -608,6 +693,95 @@ pub async fn connect_and_run(
                                         "InputEvent received but input_injector is None!"
                                     );
                                 }
+                            }
+                            Some(envelope::Payload::ClipboardData(clip)) => {
+                                tracing::debug!(
+                                    "ClipboardData received ({} chars)",
+                                    clip.text.len()
+                                );
+                                crate::clipboard::set_clipboard_text(&clip.text);
+                            }
+                            Some(envelope::Payload::MonitorSwitch(ms)) => {
+                                tracing::info!(
+                                    "MonitorSwitch requested: index {}",
+                                    ms.monitor_index
+                                );
+                                // Stop current desktop capture
+                                desktop_capturer.stop_capture(&session_id);
+                                // Start capture on the new monitor
+                                let cap_handle = desktop_capturer.start_capture(
+                                    &session_id,
+                                    ms.monitor_index,
+                                    tx.clone(),
+                                );
+                                // Update input injector geometry for the new monitor
+                                if let Some(ref mut inj) = input_injector {
+                                    let monitors = crate::screen::enumerate_monitors();
+                                    if let Some(mon) =
+                                        monitors.iter().find(|m| m.index == ms.monitor_index)
+                                    {
+                                        let (tw, th) = crate::screen::get_total_screen_size();
+                                        let geom = crate::input::MonitorGeometry::for_monitor(
+                                            mon.x as i32,
+                                            mon.y as i32,
+                                            mon.width,
+                                            mon.height,
+                                            tw,
+                                            th,
+                                        );
+                                        inj.set_monitor_geometry(geom);
+                                    }
+                                }
+                                // On Linux, wait for the Mutter input handle
+                                #[cfg(target_os = "linux")]
+                                if let Some(rx) = cap_handle {
+                                    let sid = session_id.clone();
+                                    tracing::info!(session_id=%sid, "Waiting for new Mutter input handle after monitor switch");
+                                    match rx.await {
+                                        Ok(mutter_handle) => {
+                                            let (sw, sh) = (
+                                                mutter_handle.stream_width,
+                                                mutter_handle.stream_height,
+                                            );
+                                            input_injector = Some(InputInjector::Mutter(
+                                                crate::input::MutterInputInjector::new(
+                                                    mutter_handle.conn,
+                                                    mutter_handle.rd_session,
+                                                    sw,
+                                                    sh,
+                                                ),
+                                            ));
+                                        }
+                                        Err(_) => {
+                                            tracing::warn!("Mutter input handle channel dropped on monitor switch");
+                                        }
+                                    }
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                let _ = cap_handle;
+                            }
+                            Some(envelope::Payload::Ping(ping)) => {
+                                // Echo the timestamp back as a Pong
+                                let pong = Envelope {
+                                    id: Uuid::new_v4().to_string(),
+                                    session_id: session_id.clone(),
+                                    timestamp: None,
+                                    payload: Some(envelope::Payload::Pong(sc_protocol::Pong {
+                                        timestamp: ping.timestamp,
+                                    })),
+                                };
+                                let mut buf = Vec::new();
+                                if pong.encode(&mut buf).is_ok() {
+                                    let _ = tx.send(buf);
+                                }
+                            }
+                            Some(envelope::Payload::QualitySettings(qs)) => {
+                                tracing::info!(
+                                    "QualitySettings received: quality={}, max_fps={}",
+                                    qs.quality,
+                                    qs.max_fps
+                                );
+                                desktop_capturer.set_quality(&session_id, qs.quality, qs.max_fps);
                             }
                             Some(envelope::Payload::CommandRequest(cmd)) => {
                                 tracing::info!("Command requested: {} {:?}", cmd.command, cmd.args);

@@ -15,7 +15,7 @@ import { useSearchParams } from 'next/navigation';
 import ChatPanel from '@/components/chat-panel';
 import type { DesktopViewerHandle, ViewerStatus } from '@/components/desktop-viewer';
 import type { MonitorInfo } from '@/lib/proto';
-import { encodeKeyEvent } from '@/lib/proto';
+import { encodeKeyEvent, encodeClipboardData, encodeMonitorSwitch, encodeQualitySettings } from '@/lib/proto';
 import {
   ArrowLeft,
   Monitor,
@@ -38,6 +38,7 @@ import {
   WifiOff,
   RefreshCw,
   MonitorSmartphone,
+  Gauge,
 } from 'lucide-react';
 import { useToast } from '@/components/toast';
 
@@ -95,6 +96,12 @@ export default function DesktopPage({ params }: PageProps) {
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   const [resolution, setResolution] = useState({ width: 0, height: 0 });
   const [fps, setFps] = useState(0);
+  const [latency, setLatency] = useState(0);
+  const [activeMonitor, setActiveMonitor] = useState(0);
+  const [showQuality, setShowQuality] = useState(false);
+  const [qualityPreset, setQualityPreset] = useState<'auto' | 'low' | 'medium' | 'high' | 'ultra'>('auto');
+  const [autoQualityTier, setAutoQualityTier] = useState('Auto');
+  const qualityRef = useRef<HTMLDivElement>(null);
 
   const pageRef = useRef<HTMLDivElement>(null);
   const keysRef = useRef<HTMLDivElement>(null);
@@ -198,6 +205,7 @@ export default function DesktopPage({ params }: PageProps) {
     const handler = (e: MouseEvent) => {
       if (keysRef.current && !keysRef.current.contains(e.target as Node)) setShowKeys(false);
       if (monitorsRef.current && !monitorsRef.current.contains(e.target as Node)) setShowMonitors(false);
+      if (qualityRef.current && !qualityRef.current.contains(e.target as Node)) setShowQuality(false);
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
@@ -298,33 +306,13 @@ export default function DesktopPage({ params }: PageProps) {
       const text = await navigator.clipboard.readText();
       if (!text) { info('Clipboard', 'Clipboard is empty'); return; }
 
-      // Type the clipboard text character by character by sending key events
       const handle = viewerRef.current;
       if (!handle) return;
 
-      // Send each character as a key event
-      for (const ch of text) {
-        const code = ch.charCodeAt(0);
-        if (code >= 32 && code <= 126) {
-          // ASCII printable — send as unicode key
-          const keyCode = ch.toUpperCase().charCodeAt(0);
-          const needsShift = ch !== ch.toLowerCase() || '~!@#$%^&*()_+{}|:"<>?'.includes(ch);
-          handle.sendInput(encodeKeyEvent(sessionId, keyCode, true, {
-            ctrl: false, alt: false, shift: needsShift, meta: false,
-          }));
-          handle.sendInput(encodeKeyEvent(sessionId, keyCode, false, {
-            ctrl: false, alt: false, shift: false, meta: false,
-          }));
-        } else if (ch === '\n') {
-          handle.sendInput(encodeKeyEvent(sessionId, 13, true, { ctrl: false, alt: false, shift: false, meta: false }));
-          handle.sendInput(encodeKeyEvent(sessionId, 13, false, { ctrl: false, alt: false, shift: false, meta: false }));
-        } else if (ch === '\t') {
-          handle.sendInput(encodeKeyEvent(sessionId, 9, true, { ctrl: false, alt: false, shift: false, meta: false }));
-          handle.sendInput(encodeKeyEvent(sessionId, 9, false, { ctrl: false, alt: false, shift: false, meta: false }));
-        }
-      }
-
-      info('Clipboard Sent', `Typed ${text.length} characters to remote`);
+      // Send clipboard content as a single ClipboardData proto message
+      // The agent will set it natively via arboard — instant, no keystroke simulation
+      handle.sendInput(encodeClipboardData(sessionId, text));
+      info('Clipboard Synced', `${text.length} chars sent to remote clipboard`);
     } catch {
       info('Clipboard', 'Grant clipboard permission to sync');
     }
@@ -407,6 +395,14 @@ export default function DesktopPage({ params }: PageProps) {
               <span className="font-mono text-gray-600">{resolution.width}×{resolution.height}</span>
             )}
             <span className="font-mono text-purple-400/60">{fps} FPS</span>
+            {latency > 0 && (
+              <span className="font-mono text-cyan-400/60">
+                {latency}ms
+                {qualityPreset === 'auto' && autoQualityTier !== 'Auto' && (
+                  <span className="ml-1 text-cyan-300/40">· {autoQualityTier}</span>
+                )}
+              </span>
+            )}
             <span className="flex items-center gap-1">
               <StatusIcon className={`w-3 h-3 ${statusColor} ${viewerStatus === 'connecting' || viewerStatus === 'reconnecting' ? 'animate-spin' : ''}`} />
               <span className={statusColor}>{elapsed}</span>
@@ -470,6 +466,11 @@ export default function DesktopPage({ params }: PageProps) {
                       key={i}
                       className="w-full flex items-center justify-between px-3 py-2 text-xs text-gray-300 hover:bg-white/5 transition-colors"
                       onClick={() => {
+                        const handle = viewerRef.current;
+                        if (handle) {
+                          handle.sendInput(encodeMonitorSwitch(sessionId, i));
+                        }
+                        setActiveMonitor(i);
                         info('Monitor Selected', `Switched to display ${i + 1}: ${m.width}×${m.height}`);
                         setShowMonitors(false);
                       }}
@@ -478,6 +479,7 @@ export default function DesktopPage({ params }: PageProps) {
                         <Monitor className="w-3 h-3 text-gray-600" />
                         <span>Display {i + 1}</span>
                         {m.primary && <span className="text-[9px] px-1 py-0.5 bg-[#e05246]/15 text-[#e05246] rounded">Primary</span>}
+                        {i === activeMonitor && <span className="text-[9px] px-1 py-0.5 bg-emerald-500/15 text-emerald-400 rounded">Active</span>}
                       </span>
                       <span className="text-[9px] text-gray-600 font-mono">{m.width}×{m.height}</span>
                     </button>
@@ -551,6 +553,59 @@ export default function DesktopPage({ params }: PageProps) {
             )}
           </button>
 
+          {/* Quality Presets */}
+          <div className="relative" ref={qualityRef}>
+            <button
+              onClick={() => setShowQuality(!showQuality)}
+              className={`flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded border transition-colors ${showQuality
+                ? 'bg-[#e05246]/10 border-[#e05246]/30 text-[#e05246]'
+                : 'bg-[#141414] border-[#333] text-gray-500 hover:text-white hover:bg-white/5'
+                }`}
+              title="Stream quality"
+            >
+              <Gauge className="w-3 h-3" />
+              <span className="capitalize">{qualityPreset}</span>
+              <ChevronDown className="w-2.5 h-2.5" />
+            </button>
+            {showQuality && (
+              <div className="absolute top-full left-0 mt-1 w-44 bg-[#1e1e1e] border border-[#444] rounded-lg shadow-2xl z-50 py-1" style={{ animation: 'fadeIn 0.15s ease' }}>
+                <div className="px-3 py-1.5 text-[10px] text-gray-600 uppercase tracking-wider">Quality</div>
+                {[
+                  { key: 'auto' as const, label: 'Auto', quality: 0, fps: 0, desc: 'Adaptive' },
+                  { key: 'low' as const, label: 'Low', quality: 25, fps: 15, desc: 'Low bandwidth' },
+                  { key: 'medium' as const, label: 'Medium', quality: 50, fps: 24, desc: 'Balanced' },
+                  { key: 'high' as const, label: 'High', quality: 75, fps: 30, desc: 'Clear' },
+                  { key: 'ultra' as const, label: 'Ultra', quality: 95, fps: 30, desc: 'Maximum' },
+                ].map((preset) => (
+                  <button
+                    key={preset.key}
+                    onClick={() => {
+                      setQualityPreset(preset.key);
+                      const handle = viewerRef.current;
+                      if (handle) {
+                        if (preset.key === 'auto') {
+                          handle.setAutoQuality(true);
+                        } else {
+                          handle.setAutoQuality(false);
+                          handle.sendInput(encodeQualitySettings(sessionId, preset.quality, preset.fps));
+                        }
+                      }
+                      setShowQuality(false);
+                    }}
+                    className={`w-full flex items-center justify-between px-3 py-1.5 text-xs transition-colors ${qualityPreset === preset.key ? 'bg-[#e05246]/10 text-[#e05246]' : 'text-gray-300 hover:bg-white/5'
+                      }`}
+                  >
+                    <span className="flex items-center gap-2">
+                      <span>{preset.label}</span>
+                      {qualityPreset === preset.key && <span className="w-1 h-1 rounded-full bg-[#e05246]" />}
+                    </span>
+                    <span className="text-[9px] text-gray-600">{preset.desc}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
           <div className="w-px h-3.5 bg-[#333] mx-0.5" />
 
           {/* Chat */}
@@ -606,6 +661,12 @@ export default function DesktopPage({ params }: PageProps) {
               onMonitorsChange={setMonitors}
               onResolutionChange={setResolution}
               onFpsChange={setFps}
+              onLatencyChange={setLatency}
+              onAutoQualityTierChange={setAutoQualityTier}
+              onClipboardReceived={(text) => {
+                const preview = text.length > 40 ? text.slice(0, 40) + '…' : text;
+                success('Clipboard Received', preview);
+              }}
             />
           </div>
         </div>

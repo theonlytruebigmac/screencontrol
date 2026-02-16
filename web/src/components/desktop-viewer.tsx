@@ -20,6 +20,9 @@ import {
     encodeMouseScroll,
     encodeKeyEvent,
     encodeSessionEnd,
+    encodeClipboardData,
+    encodePing,
+    encodeQualitySettings,
     type MonitorInfo,
 } from '@/lib/proto';
 import { Monitor } from 'lucide-react';
@@ -35,6 +38,9 @@ export interface DesktopViewerHandle {
     getStatus: () => ViewerStatus;
     getResolution: () => { width: number; height: number };
     getFps: () => number;
+    getLatency: () => number;
+    setAutoQuality: (enabled: boolean) => void;
+    getAutoQualityTier: () => string;
 }
 
 interface DesktopViewerProps {
@@ -45,6 +51,9 @@ interface DesktopViewerProps {
     onMonitorsChange?: (monitors: MonitorInfo[]) => void;
     onResolutionChange?: (res: { width: number; height: number }) => void;
     onFpsChange?: (fps: number) => void;
+    onLatencyChange?: (latencyMs: number) => void;
+    onAutoQualityTierChange?: (tier: string) => void;
+    onClipboardReceived?: (text: string) => void;
 }
 
 // Map browser e.code to keyCode for backward compat with the agent
@@ -113,7 +122,7 @@ function drawCursorArrow(ctx: CanvasRenderingContext2D, cx: number, cy: number, 
 }
 
 const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(function DesktopViewer(
-    { sessionId, className, showStatusBar = false, onStatusChange, onMonitorsChange, onResolutionChange, onFpsChange },
+    { sessionId, className, showStatusBar = false, onStatusChange, onMonitorsChange, onResolutionChange, onFpsChange, onLatencyChange, onAutoQualityTierChange, onClipboardReceived },
     ref
 ) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -122,7 +131,9 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
     const [status, setStatus] = useState<ViewerStatus>('connecting');
     const [resolution, setResolution] = useState({ width: 0, height: 0 });
     const [fps, setFps] = useState(0);
+    const [latency, setLatency] = useState(0);
     const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
+    const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const [hasFocus, setHasFocus] = useState(false);
     const cursorNormRef = useRef<{ x: number; y: number } | null>(null);
     const frameCountRef = useRef(0);
@@ -135,11 +146,22 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
     const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
     const pendingFrameRef = useRef(0); // tracks in-flight frame decodes
 
+    // ── Auto-adaptive quality ──
+    const autoQualityRef = useRef(false);
+    const currentTierRef = useRef('Auto');
+    const lastTierSentRef = useRef('');
+
+    // ── WebCodecs H264 decoder ──
+    const h264DecoderRef = useRef<VideoDecoder | null>(null);
+    const h264ConfiguredRef = useRef(false);
+    const h264TimestampRef = useRef(0);
+
     // Propagate state to parent
     useEffect(() => { onStatusChange?.(status); }, [status, onStatusChange]);
     useEffect(() => { onMonitorsChange?.(monitors); }, [monitors, onMonitorsChange]);
     useEffect(() => { onResolutionChange?.(resolution); }, [resolution, onResolutionChange]);
     useEffect(() => { onFpsChange?.(fps); }, [fps, onFpsChange]);
+    useEffect(() => { onLatencyChange?.(latency); }, [latency, onLatencyChange]);
 
     // Expose controls to parent via ref
     useImperativeHandle(ref, () => ({
@@ -151,7 +173,18 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
         getStatus: () => status,
         getResolution: () => resolution,
         getFps: () => fps,
-    }), [monitors, status, resolution, fps]);
+        getLatency: () => latency,
+        setAutoQuality: (enabled: boolean) => {
+            autoQualityRef.current = enabled;
+            if (!enabled) {
+                currentTierRef.current = 'Manual';
+                lastTierSentRef.current = '';
+            } else {
+                currentTierRef.current = 'Auto';
+            }
+        },
+        getAutoQualityTier: () => currentTierRef.current,
+    }), [monitors, status, resolution, fps, latency]);
 
     // FPS counter
     useEffect(() => {
@@ -179,6 +212,14 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
             console.log(`[Desktop WS] Connected to session ${sessionId}`);
             setStatus('connected');
             reconnectAttemptRef.current = 0;
+
+            // Start ping interval for latency measurement
+            if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+            pingIntervalRef.current = setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(encodePing(sessionId, Date.now()));
+                }
+            }, 2000);
         };
 
         ws.onmessage = (event) => {
@@ -191,47 +232,98 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
             switch (envelope.payload.type) {
                 case 'desktop_frame': {
                     const frame = envelope.payload;
+                    const CODEC_H264 = 1;
 
-                    // Frame-skip: if a decode is already in flight, drop this frame
-                    if (pendingFrameRef.current > 1) {
-                        break;
-                    }
-                    pendingFrameRef.current++;
-
-                    const blob = new Blob([new Uint8Array(frame.data)], { type: 'image/jpeg' });
-                    createImageBitmap(blob).then((bitmap) => {
-                        pendingFrameRef.current--;
-                        if (cancelledRef.current) { bitmap.close(); return; }
-                        const canvas = canvasRef.current;
-                        if (!canvas) { bitmap.close(); return; }
-
-                        if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
-                            canvas.width = bitmap.width;
-                            canvas.height = bitmap.height;
-                            ctxRef.current = null; // invalidated by resize
-                            setResolution({ width: bitmap.width, height: bitmap.height });
+                    if (frame.codec === CODEC_H264) {
+                        // ── H264 path via WebCodecs VideoDecoder ──
+                        if (typeof VideoDecoder === 'undefined') {
+                            // Browser doesn't support WebCodecs — skip H264 frames
+                            break;
                         }
 
-                        // Acquire 2D context once and cache
-                        if (!ctxRef.current) {
-                            ctxRef.current = canvas.getContext('2d');
+                        // Initialize decoder on first keyframe
+                        if (!h264DecoderRef.current || h264DecoderRef.current.state === 'closed') {
+                            if (!frame.isKeyframe) break; // can't start without a keyframe
+
+                            const drawDecodedFrame = (videoFrame: VideoFrame) => {
+                                if (cancelledRef.current) { videoFrame.close(); return; }
+                                const canvas = canvasRef.current;
+                                if (!canvas) { videoFrame.close(); return; }
+
+                                const vw = videoFrame.displayWidth;
+                                const vh = videoFrame.displayHeight;
+                                if (canvas.width !== vw || canvas.height !== vh) {
+                                    canvas.width = vw;
+                                    canvas.height = vh;
+                                    ctxRef.current = null;
+                                    setResolution({ width: vw, height: vh });
+                                }
+                                if (!ctxRef.current) ctxRef.current = canvas.getContext('2d');
+                                const ctx = ctxRef.current;
+                                if (ctx) {
+                                    ctx.drawImage(videoFrame, 0, 0);
+                                    const cp = cursorNormRef.current;
+                                    if (cp) drawCursorArrow(ctx, cp.x * canvas.width, cp.y * canvas.height, canvas.width);
+                                }
+                                videoFrame.close();
+                                frameCountRef.current++;
+                            };
+
+                            h264DecoderRef.current = new VideoDecoder({
+                                output: drawDecodedFrame,
+                                error: (e) => console.error('[H264] Decode error:', e),
+                            });
+
+                            h264DecoderRef.current.configure({
+                                codec: 'avc1.42001f', // Baseline profile, level 3.1
+                                optimizeForLatency: true,
+                            });
+                            h264ConfiguredRef.current = true;
+                            h264TimestampRef.current = 0;
                         }
-                        const ctx = ctxRef.current;
-                        if (ctx) {
-                            ctx.drawImage(bitmap, 0, 0);
-                            // Draw cursor arrow on top of frame
-                            const cp = cursorNormRef.current;
-                            if (cp) {
-                                const cx = cp.x * canvas.width;
-                                const cy = cp.y * canvas.height;
-                                drawCursorArrow(ctx, cx, cy, canvas.width);
+
+                        const decoder = h264DecoderRef.current;
+                        if (decoder && decoder.state === 'configured') {
+                            // Throttle: skip if decoder queue is backing up
+                            if (decoder.decodeQueueSize > 3) break;
+
+                            const chunk = new EncodedVideoChunk({
+                                type: frame.isKeyframe ? 'key' : 'delta',
+                                timestamp: h264TimestampRef.current,
+                                data: frame.data,
+                            });
+                            h264TimestampRef.current += 33333; // ~30fps in microseconds
+                            decoder.decode(chunk);
+                        }
+                    } else {
+                        // ── JPEG path (codec === 0 or unset) ──
+                        if (pendingFrameRef.current > 1) break;
+                        pendingFrameRef.current++;
+
+                        const blob = new Blob([new Uint8Array(frame.data)], { type: 'image/jpeg' });
+                        createImageBitmap(blob).then((bitmap) => {
+                            pendingFrameRef.current--;
+                            if (cancelledRef.current) { bitmap.close(); return; }
+                            const canvas = canvasRef.current;
+                            if (!canvas) { bitmap.close(); return; }
+
+                            if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+                                canvas.width = bitmap.width;
+                                canvas.height = bitmap.height;
+                                ctxRef.current = null;
+                                setResolution({ width: bitmap.width, height: bitmap.height });
                             }
-                        }
-                        bitmap.close(); // release GPU memory immediately
-                        frameCountRef.current++;
-                    }).catch(() => {
-                        pendingFrameRef.current--;
-                    });
+                            if (!ctxRef.current) ctxRef.current = canvas.getContext('2d');
+                            const ctx = ctxRef.current;
+                            if (ctx) {
+                                ctx.drawImage(bitmap, 0, 0);
+                                const cp = cursorNormRef.current;
+                                if (cp) drawCursorArrow(ctx, cp.x * canvas.width, cp.y * canvas.height, canvas.width);
+                            }
+                            bitmap.close();
+                            frameCountRef.current++;
+                        }).catch(() => { pendingFrameRef.current--; });
+                    }
                     break;
                 }
                 case 'screen_info': {
@@ -248,6 +340,45 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
                     setStatus('disconnected');
                     break;
                 }
+                case 'clipboard_data': {
+                    const clip = envelope.payload;
+                    if (clip.text && navigator.clipboard) {
+                        navigator.clipboard.writeText(clip.text).catch(() => {
+                            console.debug('[Clipboard] writeText not allowed');
+                        });
+                        onClipboardReceived?.(clip.text);
+                    }
+                    break;
+                }
+                case 'pong': {
+                    const rtt = Date.now() - envelope.payload.timestamp;
+                    setLatency(rtt);
+
+                    // Auto-adaptive quality: adjust tier based on RTT
+                    if (autoQualityRef.current && ws.readyState === WebSocket.OPEN) {
+                        let tier: string;
+                        let quality: number;
+                        let maxFps: number;
+                        if (rtt < 50) {
+                            tier = 'Ultra'; quality = 95; maxFps = 30;
+                        } else if (rtt < 100) {
+                            tier = 'High'; quality = 75; maxFps = 30;
+                        } else if (rtt < 200) {
+                            tier = 'Medium'; quality = 50; maxFps = 24;
+                        } else {
+                            tier = 'Low'; quality = 25; maxFps = 15;
+                        }
+                        // Only send when tier changes to avoid flooding
+                        if (tier !== lastTierSentRef.current) {
+                            lastTierSentRef.current = tier;
+                            currentTierRef.current = tier;
+                            onAutoQualityTierChange?.(tier);
+                            ws.send(encodeQualitySettings(sessionId, quality, maxFps));
+                            console.log(`[AutoQuality] RTT=${rtt}ms → ${tier} (q=${quality}, fps=${maxFps})`);
+                        }
+                    }
+                    break;
+                }
                 default:
                     break;
             }
@@ -256,6 +387,12 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
         ws.onclose = () => {
             if (cancelledRef.current) return;
             console.log(`[Desktop WS] Disconnected from session ${sessionId}`);
+
+            // Stop ping interval
+            if (pingIntervalRef.current) {
+                clearInterval(pingIntervalRef.current);
+                pingIntervalRef.current = null;
+            }
 
             // Auto-reconnect unless intentionally closed
             if (!intentionalCloseRef.current) {
@@ -428,6 +565,13 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
                         }
                     }}
                     onContextMenu={(e) => e.preventDefault()}
+                    onPaste={(e) => {
+                        e.preventDefault();
+                        const text = e.clipboardData?.getData('text/plain');
+                        if (text) {
+                            sendBinary(encodeClipboardData(sessionId, text));
+                        }
+                    }}
                 />
 
 

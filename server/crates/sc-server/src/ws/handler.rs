@@ -143,6 +143,14 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>) {
                                 }
                             }
 
+                            // ── Clipboard + Pong (relay to console) ──
+                            Some(envelope::Payload::ClipboardData(_))
+                            | Some(envelope::Payload::Pong(_)) => {
+                                if let Ok(sid) = Uuid::parse_str(&session_id) {
+                                    state.registry.send_to_console(&sid, data.to_vec());
+                                }
+                            }
+
                             // ── Chat (relay + persist) ─────────────────────
                             Some(envelope::Payload::ChatMessage(ref msg)) => {
                                 if let Ok(sid) = Uuid::parse_str(&session_id) {
@@ -306,6 +314,16 @@ async fn handle_console_socket(socket: WebSocket, session_id: Uuid, state: Arc<A
 
                             // ── Input events (relay to agent) ──
                             Some(envelope::Payload::InputEvent(_)) => {
+                                state
+                                    .registry
+                                    .send_to_session_agent(&session_id, data.to_vec());
+                            }
+
+                            // ── Clipboard / Monitor switch / Ping / Quality (relay to agent) ──
+                            Some(envelope::Payload::ClipboardData(_))
+                            | Some(envelope::Payload::MonitorSwitch(_))
+                            | Some(envelope::Payload::Ping(_))
+                            | Some(envelope::Payload::QualitySettings(_)) => {
                                 state
                                     .registry
                                     .send_to_session_agent(&session_id, data.to_vec());

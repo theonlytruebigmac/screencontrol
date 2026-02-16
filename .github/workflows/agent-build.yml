@@ -1,0 +1,261 @@
+name: Build Agent Binaries
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for creating releases
+  packages: read
+
+jobs:
+  build-agents:
+    runs-on: [self-hosted, actions-screencontrol]
+
+    env:
+      OSXCROSS_ROOT: /tmp/osxcross
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      # ── System dependencies ────────────────────────────────────
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler \
+            gcc-aarch64-linux-gnu \
+            gcc-mingw-w64-x86-64 \
+            clang llvm-dev libxml2-dev uuid-dev \
+            libssl-dev bash patch make tar xz-utils \
+            bzip2 gzip cpio libbz2-dev zlib1g-dev cmake
+
+      - name: Install Rust targets
+        run: |
+          rustup target add x86_64-unknown-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+          rustup target add x86_64-apple-darwin
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-pc-windows-gnu
+
+      # ── osxcross setup ─────────────────────────────────────────
+
+      - name: Cache osxcross toolchain
+        id: osxcross-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/osxcross
+          key: osxcross-${{ hashFiles('sdk/MacOSX*') }}
+
+      - name: Build osxcross from bundled SDK
+        if: steps.osxcross-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          # Find SDK tarballs (.tar.xz or .tar.bz2)
+          SDK_TARBALLS=$(ls sdk/MacOSX*.sdk.tar.{xz,bz2} 2>/dev/null)
+          if [ -z "$SDK_TARBALLS" ]; then
+            echo "❌ No MacOSX*.sdk.tar.{xz,bz2} found in sdk/"
+            exit 1
+          fi
+          echo "━━━ Building osxcross with the following SDKs: ━━━"
+          echo "$SDK_TARBALLS"
+
+          # Clone osxcross
+          git clone --depth=1 https://github.com/tpoechtrager/osxcross.git /tmp/osxcross-src
+
+          # Copy ALL bundled SDK tarballs
+          for tarball in $SDK_TARBALLS; do
+            cp "$tarball" /tmp/osxcross-src/tarballs/
+            echo "  → copied $(basename "$tarball")"
+          done
+
+          # Build osxcross (non-interactive)
+          cd /tmp/osxcross-src
+          UNATTENDED=1 ./build.sh
+
+          # Move the built toolchain to the cache path
+          mkdir -p "$OSXCROSS_ROOT"
+          cp -r /tmp/osxcross-src/target/* "$OSXCROSS_ROOT/"
+
+          echo "✅ osxcross built successfully"
+          ls "$OSXCROSS_ROOT/bin/" | head -20
+
+      - name: Verify osxcross
+        run: |
+          echo "osxcross bin contents:"
+          ls "$OSXCROSS_ROOT/bin/" | grep -E "(clang|ar)" | head -10
+          # Find the actual binary prefix (may include SDK version)
+          DARWIN_PREFIX=$(ls "$OSXCROSS_ROOT/bin/" | grep -oP '^[a-z0-9_]+-apple-darwin[0-9.]*' | head -1)
+          echo "darwin_prefix=$DARWIN_PREFIX" >> "$GITHUB_ENV"
+          echo "Detected Darwin prefix: $DARWIN_PREFIX"
+
+      # ── Configure Cargo linkers ────────────────────────────────
+
+      - name: Configure Cargo cross-linkers
+        run: |
+          mkdir -p ~/.cargo
+
+          # Determine the osxcross clang wrapper names
+          X86_CLANG=$(ls "$OSXCROSS_ROOT/bin/" | grep 'x86_64-apple-darwin.*-clang$' | head -1)
+          ARM_CLANG=$(ls "$OSXCROSS_ROOT/bin/" | grep 'aarch64-apple-darwin.*-clang$' | head -1)
+          X86_AR=$(ls "$OSXCROSS_ROOT/bin/" | grep 'x86_64-apple-darwin.*-ar$' | head -1)
+          ARM_AR=$(ls "$OSXCROSS_ROOT/bin/" | grep 'aarch64-apple-darwin.*-ar$' | head -1)
+
+          cat > ~/.cargo/config.toml << TOML
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+
+          [target.x86_64-pc-windows-gnu]
+          linker = "x86_64-w64-mingw32-gcc"
+
+          [target.x86_64-apple-darwin]
+          linker = "${OSXCROSS_ROOT}/bin/${X86_CLANG}"
+          ar = "${OSXCROSS_ROOT}/bin/${X86_AR}"
+
+          [target.aarch64-apple-darwin]
+          linker = "${OSXCROSS_ROOT}/bin/${ARM_CLANG}"
+          ar = "${OSXCROSS_ROOT}/bin/${ARM_AR}"
+          TOML
+
+          echo "✅ Cargo config written:"
+          cat ~/.cargo/config.toml
+
+      # ── Build all targets ──────────────────────────────────────
+
+      - name: Build sc-agent (Linux x86_64)
+        run: |
+          cargo build --manifest-path server/Cargo.toml \
+            --package sc-agent --release --target x86_64-unknown-linux-gnu
+
+      - name: Build sc-agent (Linux aarch64)
+        run: |
+          cargo build --manifest-path server/Cargo.toml \
+            --package sc-agent --release --target aarch64-unknown-linux-gnu
+
+      - name: Build sc-agent (macOS x86_64)
+        env:
+          PATH: /tmp/osxcross/bin:/usr/bin:/bin:${{ env.PATH }}
+        run: |
+          cargo build --manifest-path server/Cargo.toml \
+            --package sc-agent --release --target x86_64-apple-darwin
+
+      - name: Build sc-agent (macOS aarch64)
+        env:
+          PATH: /tmp/osxcross/bin:/usr/bin:/bin:${{ env.PATH }}
+        run: |
+          cargo build --manifest-path server/Cargo.toml \
+            --package sc-agent --release --target aarch64-apple-darwin
+
+      - name: Build sc-agent (Windows x86_64)
+        run: |
+          cargo build --manifest-path server/Cargo.toml \
+            --package sc-agent --release --target x86_64-pc-windows-gnu
+
+      # ── Collect binaries & generate manifest ───────────────────
+
+      - name: Collect agent binaries
+        run: |
+          BUILD_DIR="server/agent-builds"
+          TARGET_DIR="server/target"
+          mkdir -p "$BUILD_DIR"
+
+          declare -A TARGETS=(
+            ["x86_64-unknown-linux-gnu"]="sc-agent-linux-x86_64"
+            ["aarch64-unknown-linux-gnu"]="sc-agent-linux-aarch64"
+            ["x86_64-apple-darwin"]="sc-agent-macos-x86_64"
+            ["aarch64-apple-darwin"]="sc-agent-macos-aarch64"
+            ["x86_64-pc-windows-gnu"]="sc-agent-windows-x86_64.exe"
+          )
+
+          for triple in "${!TARGETS[@]}"; do
+            output="${TARGETS[$triple]}"
+            bin_name="sc-agent"
+            [[ "$triple" == *windows* ]] && bin_name="sc-agent.exe"
+            src="$TARGET_DIR/$triple/release/$bin_name"
+
+            if [ -f "$src" ]; then
+              cp "$src" "$BUILD_DIR/$output"
+              chmod +x "$BUILD_DIR/$output" 2>/dev/null || true
+              SIZE=$(stat -c%s "$BUILD_DIR/$output")
+              echo "✅ $output ($SIZE bytes)"
+            else
+              echo "⚠️  $output not found — build may have failed"
+            fi
+          done
+
+      - name: Generate manifest.json
+        run: |
+          python3 - server/agent-builds << 'PYEOF'
+          import json, os, sys, hashlib
+
+          build_dir = sys.argv[1]
+
+          # Read version from workspace Cargo.toml
+          version = "0.1.0"
+          with open("server/Cargo.toml") as f:
+              in_pkg = False
+              for line in f:
+                  if "[workspace.package]" in line:
+                      in_pkg = True
+                  elif in_pkg and line.strip().startswith("version"):
+                      version = line.split('"')[1]
+                      break
+
+          from datetime import datetime, timezone
+          built_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          builds = {}
+          for f in sorted(os.listdir(build_dir)):
+              if not f.startswith("sc-agent-"):
+                  continue
+              path = os.path.join(build_dir, f)
+              if not os.path.isfile(path):
+                  continue
+              sha = hashlib.sha256(open(path, "rb").read()).hexdigest()
+              size = os.path.getsize(path)
+              key = f.replace("sc-agent-", "").replace(".exe", "")
+              builds[key] = {"file": f, "sha256": sha, "size": size}
+
+          manifest = {
+              "version": version,
+              "built_at": built_at,
+              "builds": builds,
+              "release_notes": "",
+              "mandatory": False,
+          }
+
+          out = os.path.join(build_dir, "manifest.json")
+          with open(out, "w") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          print(f"✅ manifest.json: {len(builds)} build(s)")
+          for k, v in builds.items():
+              print(f"   {k}: {v['file']} ({v['size']} bytes)")
+          PYEOF
+
+      # ── Upload artifacts ───────────────────────────────────────
+
+      - name: Upload agent binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-builds
+          path: server/agent-builds/
+          retention-days: 30
+
+      # ── GitHub Release (on tag push only) ──────────────────────
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            server/agent-builds/sc-agent-*
+            server/agent-builds/manifest.json
+          generate_release_notes: true

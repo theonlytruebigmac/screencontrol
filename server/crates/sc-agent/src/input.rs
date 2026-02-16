@@ -1,22 +1,22 @@
 //! Input injection for remote desktop sessions.
 //!
-//! On Linux/Wayland (GNOME), uses the Mutter RemoteDesktop D-Bus API to inject
-//! input events directly through the compositor — no portal consent dialog, no
-//! hardware cursor hijacking.
-//!
-//! On other platforms (or X11 fallback), uses the `enigo` crate.
+//! Platform-specific backends:
+//! - **Linux/Wayland (GNOME)**: Mutter RemoteDesktop D-Bus API — zero-overhead,
+//!   no portal consent dialog.
+//! - **macOS**: CoreGraphics event posting via FFI.
+//! - **Windows**: Native Win32 `SendInput` API for lowest latency.
+//! - **Fallback**: `enigo` crate (X11 / macOS / Windows).
 
 use sc_protocol::input_event;
 
 /// Handles input injection for desktop sessions.
-/// Supports two backends:
-/// - Mutter D-Bus (Linux/Wayland) — zero-overhead, no consent dialog
-/// - Enigo (fallback for X11 / macOS / Windows)
 pub enum InputInjector {
     #[cfg(target_os = "linux")]
     Mutter(MutterInputInjector),
     #[cfg(target_os = "macos")]
     CoreGraphics(CoreGraphicsInputInjector),
+    #[cfg(target_os = "windows")]
+    Win32(Win32InputInjector),
     #[allow(dead_code)]
     Enigo(EnigoInputInjector),
 }
@@ -29,8 +29,119 @@ impl InputInjector {
             InputInjector::Mutter(m) => m.handle_event(event),
             #[cfg(target_os = "macos")]
             InputInjector::CoreGraphics(cg) => cg.handle_event(event),
+            #[cfg(target_os = "windows")]
+            InputInjector::Win32(w) => w.handle_event(event),
             InputInjector::Enigo(e) => e.handle_event(event),
         }
+    }
+
+    /// Release all held modifier keys to prevent "stuck key" syndrome.
+    /// Should be called when a desktop session ends.
+    pub fn release_all_keys(&mut self) {
+        match self {
+            #[cfg(target_os = "linux")]
+            InputInjector::Mutter(m) => m.release_all_modifiers(),
+            #[cfg(target_os = "macos")]
+            InputInjector::CoreGraphics(cg) => cg.release_all_modifiers(),
+            #[cfg(target_os = "windows")]
+            InputInjector::Win32(w) => w.release_all_modifiers(),
+            InputInjector::Enigo(e) => e.release_all_modifiers(),
+        }
+    }
+
+    /// Update the monitor geometry for multi-monitor coordinate mapping.
+    /// Backends that support per-monitor offsets will use this to
+    /// transform normalized coordinates to the correct monitor.
+    pub fn set_monitor_geometry(&mut self, geometry: MonitorGeometry) {
+        tracing::info!(?geometry, "Setting monitor geometry on input injector");
+        match self {
+            #[cfg(target_os = "linux")]
+            InputInjector::Mutter(m) => {
+                m.screen_width = geometry.width;
+                m.screen_height = geometry.height;
+                // Mutter D-Bus uses per-monitor coordinates already
+            }
+            #[cfg(target_os = "macos")]
+            InputInjector::CoreGraphics(cg) => {
+                cg.screen_width = geometry.width;
+                cg.screen_height = geometry.height;
+            }
+            #[cfg(target_os = "windows")]
+            InputInjector::Win32(w) => {
+                w.geometry = geometry;
+            }
+            InputInjector::Enigo(e) => {
+                e.screen_width = geometry.width;
+                e.screen_height = geometry.height;
+            }
+        }
+    }
+}
+
+// ─── Multi-Monitor Coordinate Mapping ──────────────────────────────────
+
+/// Describes the geometry of the monitor being captured for input injection.
+/// Converts normalized (0.0–1.0) canvas coordinates into absolute pixel
+/// coordinates that account for multi-monitor offset.
+#[derive(Debug, Clone)]
+pub struct MonitorGeometry {
+    /// Offset of this monitor's origin from the virtual desktop origin.
+    pub x_offset: i32,
+    pub y_offset: i32,
+    /// Pixel dimensions of this monitor.
+    pub width: u32,
+    pub height: u32,
+    /// Total virtual desktop size (needed for platforms like Win32 that
+    /// use 0–65535 absolute coordinates spanning the entire desktop).
+    pub total_width: u32,
+    pub total_height: u32,
+}
+
+impl MonitorGeometry {
+    /// Create geometry for a single-monitor (or full-desktop) setup.
+    pub fn single(screen_width: u32, screen_height: u32) -> Self {
+        Self {
+            x_offset: 0,
+            y_offset: 0,
+            width: screen_width,
+            height: screen_height,
+            total_width: screen_width,
+            total_height: screen_height,
+        }
+    }
+
+    /// Create geometry for a specific monitor within a multi-monitor desktop.
+    pub fn for_monitor(
+        mon_x: i32,
+        mon_y: i32,
+        mon_w: u32,
+        mon_h: u32,
+        total_w: u32,
+        total_h: u32,
+    ) -> Self {
+        Self {
+            x_offset: mon_x,
+            y_offset: mon_y,
+            width: mon_w,
+            height: mon_h,
+            total_width: total_w,
+            total_height: total_h,
+        }
+    }
+
+    /// Convert normalized (0.0–1.0) coordinates to absolute pixel coordinates.
+    pub fn to_absolute(&self, norm_x: f64, norm_y: f64) -> (f64, f64) {
+        let abs_x = self.x_offset as f64 + norm_x * self.width as f64;
+        let abs_y = self.y_offset as f64 + norm_y * self.height as f64;
+        (abs_x, abs_y)
+    }
+
+    /// Convert normalized coordinates to Win32 absolute 0–65535 range.
+    pub fn to_absolute_65535(&self, norm_x: f64, norm_y: f64) -> (i32, i32) {
+        let (abs_x, abs_y) = self.to_absolute(norm_x, norm_y);
+        let x = (abs_x / self.total_width as f64 * 65535.0) as i32;
+        let y = (abs_y / self.total_height as f64 * 65535.0) as i32;
+        (x, y)
     }
 }
 
@@ -200,6 +311,16 @@ impl MutterInputInjector {
             }
         });
     }
+
+    /// Release all modifier keys (Shift, Ctrl, Alt, Meta).
+    pub fn release_all_modifiers(&mut self) {
+        tracing::info!("Releasing all modifier keys (Mutter D-Bus)");
+        // evdev keycodes for modifiers
+        for keycode in &[42u32, 54, 29, 97, 56, 100, 125, 126] {
+            // 42=LShift, 54=RShift, 29=LCtrl, 97=RCtrl, 56=LAlt, 100=RAlt, 125=LMeta, 126=RMeta
+            self.notify_keyboard_keycode(*keycode, false);
+        }
+    }
 }
 
 /// Map web KeyboardEvent.keyCode to Linux evdev keycode.
@@ -280,6 +401,28 @@ fn map_web_keycode_to_evdev(web_code: u32) -> Option<u32> {
         45 => 110, // KEY_INSERT
         46 => 111, // KEY_DELETE
         91 => 125, // KEY_LEFTMETA (Super/Windows)
+        // Numpad
+        96 => 82,  // KEY_KP0
+        97 => 79,  // KEY_KP1
+        98 => 80,  // KEY_KP2
+        99 => 81,  // KEY_KP3
+        100 => 75, // KEY_KP4
+        101 => 76, // KEY_KP5
+        102 => 77, // KEY_KP6
+        103 => 71, // KEY_KP7
+        104 => 72, // KEY_KP8
+        105 => 73, // KEY_KP9
+        106 => 55, // KEY_KPASTERISK (Numpad *)
+        107 => 78, // KEY_KPPLUS
+        109 => 74, // KEY_KPMINUS
+        110 => 83, // KEY_KPDOT
+        111 => 98, // KEY_KPSLASH
+        // Toggle / lock keys
+        19 => 119, // KEY_PAUSE
+        44 => 99,  // KEY_SYSRQ (PrintScreen)
+        144 => 69, // KEY_NUMLOCK
+        145 => 70, // KEY_SCROLLLOCK
+        93 => 127, // KEY_COMPOSE (ContextMenu)
         // Punctuation
         186 => 39, // KEY_SEMICOLON
         187 => 13, // KEY_EQUAL
@@ -524,6 +667,20 @@ impl CoreGraphicsInputInjector {
             }
         }
     }
+
+    /// Release all modifier keys (Shift, Ctrl, Option, Command).
+    pub fn release_all_modifiers(&mut self) {
+        tracing::info!("Releasing all modifier keys (CoreGraphics)");
+        // macOS virtual key codes for modifiers
+        for &vk in &[
+            0x38u16, 0x3C, // Shift L/R
+            0x3B, 0x3E, // Control L/R
+            0x3A, 0x3D, // Option (Alt) L/R
+            0x37, 0x36, // Command L/R
+        ] {
+            self.post_key(vk, false);
+        }
+    }
 }
 
 /// Map web KeyboardEvent.keyCode to macOS virtual key code.
@@ -601,6 +758,22 @@ fn map_web_keycode_to_macos(web_code: u32) -> Option<u16> {
         40 => 0x7D, // kVK_DownArrow
         46 => 0x75, // kVK_ForwardDelete
         91 => 0x37, // kVK_Command (Meta/Super)
+        // Numpad
+        96 => 0x52,  // kVK_ANSI_Keypad0
+        97 => 0x53,  // kVK_ANSI_Keypad1
+        98 => 0x54,  // kVK_ANSI_Keypad2
+        99 => 0x55,  // kVK_ANSI_Keypad3
+        100 => 0x56, // kVK_ANSI_Keypad4
+        101 => 0x57, // kVK_ANSI_Keypad5
+        102 => 0x58, // kVK_ANSI_Keypad6
+        103 => 0x59, // kVK_ANSI_Keypad7
+        104 => 0x5B, // kVK_ANSI_Keypad8
+        105 => 0x5C, // kVK_ANSI_Keypad9
+        106 => 0x43, // kVK_ANSI_KeypadMultiply
+        107 => 0x45, // kVK_ANSI_KeypadPlus
+        109 => 0x4E, // kVK_ANSI_KeypadMinus
+        110 => 0x41, // kVK_ANSI_KeypadDecimal
+        111 => 0x4B, // kVK_ANSI_KeypadDivide
         // Punctuation
         186 => 0x29, // kVK_ANSI_Semicolon
         187 => 0x18, // kVK_ANSI_Equal
@@ -713,6 +886,15 @@ impl EnigoInputInjector {
             None => {}
         }
     }
+
+    /// Release all modifier keys via Enigo.
+    pub fn release_all_modifiers(&mut self) {
+        use enigo::{Direction, Key, Keyboard};
+        tracing::info!("Releasing all modifier keys (Enigo)");
+        for key in &[Key::Shift, Key::Control, Key::Alt, Key::Meta] {
+            let _ = self.enigo.key(*key, Direction::Release);
+        }
+    }
 }
 
 /// Map a platform-independent key code to an enigo `Key`.
@@ -751,7 +933,7 @@ fn map_key_code(code: u32) -> Option<enigo::Key> {
         16 => Some(Key::Shift),
         17 => Some(Key::Control),
         18 => Some(Key::Alt),
-        19 => None, // Pause — not available in enigo 0.2
+        19 => None, // Pause — not directly available in enigo
         20 => Some(Key::CapsLock),
         27 => Some(Key::Escape),
         32 => Some(Key::Space),
@@ -763,9 +945,29 @@ fn map_key_code(code: u32) -> Option<enigo::Key> {
         38 => Some(Key::UpArrow),
         39 => Some(Key::RightArrow),
         40 => Some(Key::DownArrow),
-        45 => None, // Insert — not available in enigo 0.2
+        45 => None, // Insert — not directly available in enigo
         46 => Some(Key::Delete),
         91 => Some(Key::Meta), // Windows/Super key
+        // Numpad
+        96 => Some(Key::Unicode('0')),
+        97 => Some(Key::Unicode('1')),
+        98 => Some(Key::Unicode('2')),
+        99 => Some(Key::Unicode('3')),
+        100 => Some(Key::Unicode('4')),
+        101 => Some(Key::Unicode('5')),
+        102 => Some(Key::Unicode('6')),
+        103 => Some(Key::Unicode('7')),
+        104 => Some(Key::Unicode('8')),
+        105 => Some(Key::Unicode('9')),
+        106 => Some(Key::Unicode('*')),
+        107 => Some(Key::Unicode('+')),
+        109 => Some(Key::Unicode('-')),
+        110 => Some(Key::Unicode('.')),
+        111 => Some(Key::Unicode('/')),
+        144 => None, // NumLock — not directly available in enigo
+        145 => None, // ScrollLock — not directly available in enigo
+        93 => None,  // ContextMenu — not directly available in enigo
+        44 => None,  // PrintScreen — not directly available in enigo
         // Punctuation
         186 => Some(Key::Unicode(';')),
         187 => Some(Key::Unicode('=')),
@@ -783,4 +985,323 @@ fn map_key_code(code: u32) -> Option<enigo::Key> {
             None
         }
     }
+}
+
+// ─── Win32 Backend (Windows native SendInput) ──────────────────────────
+
+#[cfg(target_os = "windows")]
+mod win32_ffi {
+    //! Raw FFI bindings to user32.dll for input injection.
+    //! Using raw FFI instead of the large `windows` crate to keep the binary small.
+
+    use std::os::raw::c_int;
+
+    // --- Constants ---
+    pub const INPUT_MOUSE: u32 = 0;
+    pub const INPUT_KEYBOARD: u32 = 1;
+
+    // Mouse event flags
+    pub const MOUSEEVENTF_MOVE: u32 = 0x0001;
+    pub const MOUSEEVENTF_LEFTDOWN: u32 = 0x0002;
+    pub const MOUSEEVENTF_LEFTUP: u32 = 0x0004;
+    pub const MOUSEEVENTF_RIGHTDOWN: u32 = 0x0008;
+    pub const MOUSEEVENTF_RIGHTUP: u32 = 0x0010;
+    pub const MOUSEEVENTF_MIDDLEDOWN: u32 = 0x0020;
+    pub const MOUSEEVENTF_MIDDLEUP: u32 = 0x0040;
+    pub const MOUSEEVENTF_WHEEL: u32 = 0x0800;
+    pub const MOUSEEVENTF_HWHEEL: u32 = 0x1000;
+    pub const MOUSEEVENTF_ABSOLUTE: u32 = 0x8000;
+
+    // Keyboard event flags
+    pub const KEYEVENTF_KEYUP: u32 = 0x0002;
+
+    pub const WHEEL_DELTA: i32 = 120;
+
+    // --- Structures ---
+    #[repr(C)]
+    pub struct MOUSEINPUT {
+        pub dx: i32,
+        pub dy: i32,
+        pub mouse_data: u32,
+        pub dw_flags: u32,
+        pub time: u32,
+        pub dw_extra_info: usize,
+    }
+
+    #[repr(C)]
+    pub struct KEYBDINPUT {
+        pub w_vk: u16,
+        pub w_scan: u16,
+        pub dw_flags: u32,
+        pub time: u32,
+        pub dw_extra_info: usize,
+    }
+
+    /// `INPUT` struct — we use a union-style approach via `InputUnion`.
+    #[repr(C)]
+    pub struct INPUT {
+        pub input_type: u32,
+        pub data: InputUnion,
+    }
+
+    /// Union of the possible input types. We use the largest (MOUSEINPUT).
+    #[repr(C)]
+    pub union InputUnion {
+        pub mi: std::mem::ManuallyDrop<MOUSEINPUT>,
+        pub ki: std::mem::ManuallyDrop<KEYBDINPUT>,
+    }
+
+    extern "system" {
+        pub fn SendInput(c_inputs: u32, p_inputs: *const INPUT, cb_size: c_int) -> u32;
+        pub fn GetSystemMetrics(n_index: c_int) -> c_int;
+    }
+
+    pub const SM_CXSCREEN: c_int = 0;
+    pub const SM_CYSCREEN: c_int = 1;
+}
+
+#[cfg(target_os = "windows")]
+pub struct Win32InputInjector {
+    pub geometry: MonitorGeometry,
+}
+
+#[cfg(target_os = "windows")]
+impl Win32InputInjector {
+    pub fn new(screen_width: u32, screen_height: u32) -> Self {
+        tracing::info!(
+            screen_width,
+            screen_height,
+            "Creating Win32InputInjector (SendInput)"
+        );
+        Self {
+            geometry: MonitorGeometry::single(screen_width, screen_height),
+        }
+    }
+
+    pub fn handle_event(&mut self, event: &sc_protocol::InputEvent) {
+        match &event.event {
+            Some(input_event::Event::MouseMove(mv)) => {
+                self.send_mouse_move(mv.x, mv.y);
+            }
+            Some(input_event::Event::MouseButton(btn)) => {
+                self.send_mouse_move(btn.x, btn.y);
+                self.send_mouse_button(btn.button, btn.pressed);
+            }
+            Some(input_event::Event::MouseScroll(scroll)) => {
+                if scroll.x > 0.0 || scroll.y > 0.0 {
+                    self.send_mouse_move(scroll.x, scroll.y);
+                }
+                self.send_mouse_scroll(scroll.delta_x, scroll.delta_y);
+            }
+            Some(input_event::Event::KeyEvent(key)) => {
+                if let Some(vk) = map_web_keycode_to_win32_vk(key.key_code) {
+                    self.send_key(vk, key.pressed);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn send_mouse_move(&self, norm_x: f64, norm_y: f64) {
+        // Use MonitorGeometry for multi-monitor offset-aware absolute coords
+        let (abs_x, abs_y) = self.geometry.to_absolute_65535(norm_x, norm_y);
+
+        let input = win32_ffi::INPUT {
+            input_type: win32_ffi::INPUT_MOUSE,
+            data: win32_ffi::InputUnion {
+                mi: std::mem::ManuallyDrop::new(win32_ffi::MOUSEINPUT {
+                    dx: abs_x,
+                    dy: abs_y,
+                    mouse_data: 0,
+                    dw_flags: win32_ffi::MOUSEEVENTF_MOVE | win32_ffi::MOUSEEVENTF_ABSOLUTE,
+                    time: 0,
+                    dw_extra_info: 0,
+                }),
+            },
+        };
+
+        unsafe {
+            win32_ffi::SendInput(1, &input, std::mem::size_of::<win32_ffi::INPUT>() as i32);
+        }
+    }
+
+    fn send_mouse_button(&self, button: u32, pressed: bool) {
+        let flags = match (button, pressed) {
+            (0, true) => win32_ffi::MOUSEEVENTF_LEFTDOWN,
+            (0, false) => win32_ffi::MOUSEEVENTF_LEFTUP,
+            (1, true) => win32_ffi::MOUSEEVENTF_MIDDLEDOWN,
+            (1, false) => win32_ffi::MOUSEEVENTF_MIDDLEUP,
+            (2, true) => win32_ffi::MOUSEEVENTF_RIGHTDOWN,
+            (2, false) => win32_ffi::MOUSEEVENTF_RIGHTUP,
+            _ => win32_ffi::MOUSEEVENTF_LEFTDOWN,
+        };
+
+        let input = win32_ffi::INPUT {
+            input_type: win32_ffi::INPUT_MOUSE,
+            data: win32_ffi::InputUnion {
+                mi: std::mem::ManuallyDrop::new(win32_ffi::MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouse_data: 0,
+                    dw_flags: flags,
+                    time: 0,
+                    dw_extra_info: 0,
+                }),
+            },
+        };
+
+        unsafe {
+            win32_ffi::SendInput(1, &input, std::mem::size_of::<win32_ffi::INPUT>() as i32);
+        }
+    }
+
+    fn send_mouse_scroll(&self, delta_x: f64, delta_y: f64) {
+        // Vertical scroll
+        if delta_y.abs() > 0.01 {
+            let amount = (-delta_y * win32_ffi::WHEEL_DELTA as f64) as i32;
+            let input = win32_ffi::INPUT {
+                input_type: win32_ffi::INPUT_MOUSE,
+                data: win32_ffi::InputUnion {
+                    mi: std::mem::ManuallyDrop::new(win32_ffi::MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouse_data: amount as u32,
+                        dw_flags: win32_ffi::MOUSEEVENTF_WHEEL,
+                        time: 0,
+                        dw_extra_info: 0,
+                    }),
+                },
+            };
+            unsafe {
+                win32_ffi::SendInput(1, &input, std::mem::size_of::<win32_ffi::INPUT>() as i32);
+            }
+        }
+
+        // Horizontal scroll
+        if delta_x.abs() > 0.01 {
+            let amount = (delta_x * win32_ffi::WHEEL_DELTA as f64) as i32;
+            let input = win32_ffi::INPUT {
+                input_type: win32_ffi::INPUT_MOUSE,
+                data: win32_ffi::InputUnion {
+                    mi: std::mem::ManuallyDrop::new(win32_ffi::MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouse_data: amount as u32,
+                        dw_flags: win32_ffi::MOUSEEVENTF_HWHEEL,
+                        time: 0,
+                        dw_extra_info: 0,
+                    }),
+                },
+            };
+            unsafe {
+                win32_ffi::SendInput(1, &input, std::mem::size_of::<win32_ffi::INPUT>() as i32);
+            }
+        }
+    }
+
+    fn send_key(&self, vk: u16, pressed: bool) {
+        let flags = if pressed {
+            0
+        } else {
+            win32_ffi::KEYEVENTF_KEYUP
+        };
+
+        let input = win32_ffi::INPUT {
+            input_type: win32_ffi::INPUT_KEYBOARD,
+            data: win32_ffi::InputUnion {
+                ki: std::mem::ManuallyDrop::new(win32_ffi::KEYBDINPUT {
+                    w_vk: vk,
+                    w_scan: 0,
+                    dw_flags: flags,
+                    time: 0,
+                    dw_extra_info: 0,
+                }),
+            },
+        };
+
+        unsafe {
+            win32_ffi::SendInput(1, &input, std::mem::size_of::<win32_ffi::INPUT>() as i32);
+        }
+    }
+
+    /// Release all modifier keys to prevent stuck keys on session end.
+    pub fn release_all_modifiers(&mut self) {
+        tracing::info!("Releasing all modifier keys (Win32)");
+        // VK codes for all modifier keys
+        let modifiers: &[u16] = &[
+            0x10, 0xA0, 0xA1, // VK_SHIFT, VK_LSHIFT, VK_RSHIFT
+            0x11, 0xA2, 0xA3, // VK_CONTROL, VK_LCONTROL, VK_RCONTROL
+            0x12, 0xA4, 0xA5, // VK_MENU (Alt), VK_LMENU, VK_RMENU
+            0x5B, 0x5C, // VK_LWIN, VK_RWIN
+        ];
+        for &vk in modifiers {
+            self.send_key(vk, false);
+        }
+    }
+}
+
+/// Map web KeyboardEvent.keyCode to Windows Virtual-Key code.
+#[cfg(target_os = "windows")]
+fn map_web_keycode_to_win32_vk(web_code: u32) -> Option<u16> {
+    // Most web keyCodes align directly with Windows VK codes for alphanumeric keys
+    let vk: u16 = match web_code {
+        // Letters A-Z: web keyCode 65-90 == VK_A-VK_Z
+        65..=90 => web_code as u16,
+        // Digits 0-9: web keyCode 48-57 == VK_0-VK_9
+        48..=57 => web_code as u16,
+        // Numpad 0-9: web keyCode 96-105 == VK_NUMPAD0-VK_NUMPAD9
+        96..=105 => web_code as u16,
+        // Function keys: web keyCode 112-123 == VK_F1-VK_F12
+        112..=123 => web_code as u16,
+        // Special keys (direct VK mappings)
+        8 => 0x08,  // VK_BACK
+        9 => 0x09,  // VK_TAB
+        13 => 0x0D, // VK_RETURN
+        16 => 0x10, // VK_SHIFT
+        17 => 0x11, // VK_CONTROL
+        18 => 0x12, // VK_MENU (Alt)
+        19 => 0x13, // VK_PAUSE
+        20 => 0x14, // VK_CAPITAL (CapsLock)
+        27 => 0x1B, // VK_ESCAPE
+        32 => 0x20, // VK_SPACE
+        33 => 0x21, // VK_PRIOR (PageUp)
+        34 => 0x22, // VK_NEXT (PageDown)
+        35 => 0x23, // VK_END
+        36 => 0x24, // VK_HOME
+        37 => 0x25, // VK_LEFT
+        38 => 0x26, // VK_UP
+        39 => 0x27, // VK_RIGHT
+        40 => 0x28, // VK_DOWN
+        44 => 0x2C, // VK_SNAPSHOT (PrintScreen)
+        45 => 0x2D, // VK_INSERT
+        46 => 0x2E, // VK_DELETE
+        91 => 0x5B, // VK_LWIN (Meta)
+        93 => 0x5D, // VK_APPS (ContextMenu)
+        // Numpad operators
+        106 => 0x6A, // VK_MULTIPLY
+        107 => 0x6B, // VK_ADD
+        109 => 0x6D, // VK_SUBTRACT
+        110 => 0x6E, // VK_DECIMAL
+        111 => 0x6F, // VK_DIVIDE
+        // Lock keys
+        144 => 0x90, // VK_NUMLOCK
+        145 => 0x91, // VK_SCROLL
+        // Punctuation (OEM keys)
+        186 => 0xBA, // VK_OEM_1 (;:)
+        187 => 0xBB, // VK_OEM_PLUS (=+)
+        188 => 0xBC, // VK_OEM_COMMA (,<)
+        189 => 0xBD, // VK_OEM_MINUS (-_)
+        190 => 0xBE, // VK_OEM_PERIOD (.>)
+        191 => 0xBF, // VK_OEM_2 (/?)
+        192 => 0xC0, // VK_OEM_3 (`~)
+        219 => 0xDB, // VK_OEM_4 ([{)
+        220 => 0xDC, // VK_OEM_5 (\|)
+        221 => 0xDD, // VK_OEM_6 (]})
+        222 => 0xDE, // VK_OEM_7 ('")
+        _ => {
+            tracing::debug!("Unmapped web keycode for Win32: {}", web_code);
+            return None;
+        }
+    };
+    Some(vk)
 }

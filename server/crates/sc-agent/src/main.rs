@@ -16,9 +16,11 @@
 //! ```
 
 mod chat;
+mod clipboard;
 mod command;
 mod connection;
 mod consent;
+mod ffmpeg;
 mod filebrowser;
 mod input;
 mod screen;

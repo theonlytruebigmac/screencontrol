@@ -36,6 +36,11 @@ message Envelope {
         // Remote desktop
         InputEvent          input_event           = 40;
         ScreenInfo          screen_info           = 41;
+        ClipboardData       clipboard_data        = 42;
+        MonitorSwitch       monitor_switch        = 43;
+        QualitySettings     quality_settings      = 44;
+        Ping                ping                  = 45;
+        Pong                pong                  = 46;
 
         // File transfer
         FileTransferRequest file_transfer_request = 50;
@@ -242,12 +247,49 @@ message ScreenInfo {
     uint32 active_monitor = 2;
 }
 
+enum FrameCodec {
+    FRAME_CODEC_JPEG = 0;      // JPEG-encoded frame (default, backward-compatible)
+    FRAME_CODEC_H264 = 1;      // H264 Annex B NAL unit(s)
+}
+
 message DesktopFrame {
     uint32 width = 1;
     uint32 height = 2;
-    bytes  data = 3;           // JPEG-encoded frame
+    bytes  data = 3;           // encoded frame data (JPEG or H264)
     uint32 sequence = 4;       // monotonic frame counter
-    uint32 quality = 5;        // JPEG quality used (1-100)
+    uint32 quality = 5;        // JPEG quality used (1-100), or H264 CRF
+    FrameCodec codec = 6;      // encoding format
+    bool   is_keyframe = 7;    // true for JPEG frames and H264 IDR frames
+}
+
+// ─── Clipboard ───────────────────────────────────────────────
+
+message ClipboardData {
+    string text = 1;           // UTF-8 clipboard text
+    string mime_type = 2;      // e.g. "text/plain"
+}
+
+// ─── Monitor Switching ───────────────────────────────────────
+
+message MonitorSwitch {
+    uint32 monitor_index = 1;  // Index of the monitor to switch to
+}
+
+// ─── Adaptive Quality ────────────────────────────────────────
+
+message QualitySettings {
+    uint32 quality = 1;        // JPEG quality 1-100, or 0 for auto
+    uint32 max_fps = 2;        // Target max FPS (0 = default 30)
+}
+
+// ─── Latency Measurement ─────────────────────────────────────
+
+message Ping {
+    uint64 timestamp = 1;      // Client-side timestamp (ms since epoch)
+}
+
+message Pong {
+    uint64 timestamp = 1;      // Echo of the Ping timestamp
 }
 
 // ─── File Transfer ───────────────────────────────────────────
