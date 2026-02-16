@@ -35,6 +35,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          # Clean up stale arm64 architecture from previous runs (Ubuntu 25.10 lacks arm64 repos)
+          sudo dpkg --remove-architecture arm64 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y \
             protobuf-compiler \
