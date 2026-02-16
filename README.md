@@ -63,15 +63,15 @@ ScreenControl follows a microservices-inspired architecture for scalability and 
 
 ```mermaid
 graph TD
-    User[User / Browser] <-->|HTTPS/WSS| Web[Web Console (Next.js)]
-    Web <-->|API| Server[API Server (Axum)]
-    Server <-->|SQL| DB[(PostgreSQL)]
-    Server <-->|PubSub| Redis[(Redis)]
-    Server <-->|S3 API| MinIO[(MinIO)]
+    User["User / Browser"] <-->|"HTTPS/WSS"| Web["Web Console (Next.js)"]
+    Web <-->|"API"| Server["API Server (Axum)"]
+    Server <-->|"SQL"| DB[("PostgreSQL")]
+    Server <-->|"PubSub"| Redis[("Redis")]
+    Server <-->|"S3 API"| MinIO[("MinIO")]
     
-    Agent[Remote Agent (Rust)] <-->|WSS| Server
-    Agent <-->|TCP| Relay[Relay Server]
-    User -.-|Direct/Relay| Relay
+    Agent["Remote Agent (Rust)"] <-->|"WSS"| Server
+    Agent <-->|"TCP"| Relay["Relay Server"]
+    User -.-|"Direct/Relay"| Relay
 ```
 
 | Component | Tech Stack | Description |
