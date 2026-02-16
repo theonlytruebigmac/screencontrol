@@ -44,6 +44,9 @@ jobs:
       - name: Install Rust target
         run: rustup target add x86_64-unknown-linux-gnu
 
+      - name: Clean stale Cargo config
+        run: rm -f ~/.cargo/config.toml
+
       - name: Build sc-agent (Linux x86_64)
         run: |
           cargo build --manifest-path server/Cargo.toml \
@@ -85,10 +88,11 @@ jobs:
       - name: Install Rust target
         run: rustup target add aarch64-unknown-linux-gnu
 
-      - name: Clean cross target directory
+      - name: Clean stale state
         run: |
-          # cross needs its own clean target dir to avoid GLIBC mismatch
-          # with build scripts compiled on the host
+          # Remove stale cargo config from other parallel jobs
+          rm -f ~/.cargo/config.toml
+          # cross needs a clean target dir to avoid GLIBC mismatch
           rm -rf server/target/aarch64-unknown-linux-gnu
 
       - name: Build sc-agent (Linux aarch64)
@@ -218,9 +222,8 @@ jobs:
             exit 1
           fi
 
-          # Append to cargo config (don't overwrite — other jobs may have written it)
-          cat >> ~/.cargo/config.toml << TOML
-
+          # Write a FRESH cargo config (overwrite to avoid duplicates from parallel jobs)
+          cat > ~/.cargo/config.toml << TOML
           [target.${{ matrix.target }}]
           linker = "${OSXCROSS_ROOT}/bin/${CLANG}"
           ar = "${OSXCROSS_ROOT}/bin/${AR}"
@@ -279,8 +282,7 @@ jobs:
       - name: Configure Cargo linker
         run: |
           mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << 'TOML'
-
+          cat > ~/.cargo/config.toml << 'TOML'
           [target.x86_64-pc-windows-gnu]
           linker = "x86_64-w64-mingw32-gcc"
           TOML
