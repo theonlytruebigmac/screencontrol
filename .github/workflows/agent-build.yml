@@ -67,9 +67,9 @@ jobs:
           set -euo pipefail
 
           # Find SDK tarballs (.tar.xz or .tar.bz2)
-          SDK_TARBALLS=$(ls sdk/MacOSX*.sdk.tar.{xz,bz2} 2>/dev/null)
+          SDK_TARBALLS=$(find sdk/ -maxdepth 1 -name 'MacOSX*.sdk.tar.*' 2>/dev/null || true)
           if [ -z "$SDK_TARBALLS" ]; then
-            echo "❌ No MacOSX*.sdk.tar.{xz,bz2} found in sdk/"
+            echo "❌ No MacOSX*.sdk.tar.* found in sdk/"
             exit 1
           fi
           echo "━━━ Building osxcross with the following SDKs: ━━━"
