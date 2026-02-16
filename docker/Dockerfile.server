@@ -56,8 +56,9 @@ WORKDIR /app
 COPY --from=builder /build/server/target/release/sc-server /usr/local/bin/sc-server
 COPY --from=builder /build/server/migrations /app/migrations
 
-# Copy pre-built agent binaries for the download endpoint
-COPY server/agent-builds/ /app/agent-builds/
+# Copy pre-built agent binaries for the download endpoint (may be empty)
+RUN mkdir -p /app/agent-builds
+COPY server/agent-build[s]/ /app/agent-builds/
 
 EXPOSE 8080
 

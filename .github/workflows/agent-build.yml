@@ -66,19 +66,42 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Find SDK tarballs (.tar.xz or .tar.bz2)
-          SDK_TARBALLS=$(find sdk/ -maxdepth 1 -name 'MacOSX*.sdk.tar.*' 2>/dev/null || true)
+          # Clean up any leftover state from previous failed runs
+          rm -rf /tmp/osxcross-src
+
+          # Debug: show what's in sdk/
+          echo "━━━ Contents of sdk/ ━━━"
+          ls -lh sdk/ || true
+
+          # Verify the SDK tarball is real data (not an LFS pointer)
+          for f in sdk/MacOSX*.sdk.tar.*; do
+            if [ -f "$f" ]; then
+              FIRST_BYTES=$(head -c 4 "$f" | xxd -p 2>/dev/null || echo "unknown")
+              SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
+              echo "  $f: $SIZE bytes, magic: $FIRST_BYTES"
+              if [ "$SIZE" -lt 1000000 ]; then
+                echo "  ⚠️  File is suspiciously small — may be an LFS pointer"
+                cat "$f"
+                echo ""
+                echo "  Attempting git lfs pull..."
+                git lfs pull || true
+              fi
+            fi
+          done
+
+          # Find SDK tarballs
+          SDK_TARBALLS=$(find sdk/ -maxdepth 1 -name 'MacOSX*.sdk.tar.*' -size +1M 2>/dev/null || true)
           if [ -z "$SDK_TARBALLS" ]; then
-            echo "❌ No MacOSX*.sdk.tar.* found in sdk/"
+            echo "❌ No valid MacOSX SDK tarballs found in sdk/"
             exit 1
           fi
-          echo "━━━ Building osxcross with the following SDKs: ━━━"
+          echo "━━━ Building osxcross with: ━━━"
           echo "$SDK_TARBALLS"
 
           # Clone osxcross
           git clone --depth=1 https://github.com/tpoechtrager/osxcross.git /tmp/osxcross-src
 
-          # Copy ALL bundled SDK tarballs
+          # Copy SDK tarballs
           for tarball in $SDK_TARBALLS; do
             cp "$tarball" /tmp/osxcross-src/tarballs/
             echo "  → copied $(basename "$tarball")"
