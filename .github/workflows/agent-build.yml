@@ -11,8 +11,112 @@ permissions:
   packages: read
 
 jobs:
-  build-agents:
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Native Linux x86_64 build — runs directly on the host
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  build-linux-x86:
     runs-on: [self-hosted, actions-screencontrol]
+    steps:
+      - name: Install Git LFS
+        run: |
+          if ! command -v git-lfs &>/dev/null; then
+            curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
+            sudo apt-get install -y git-lfs
+          fi
+          git lfs install
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install system dependencies
+        run: |
+          # Clean up stale arm64 architecture from previous CI runs
+          sudo dpkg --remove-architecture arm64 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler pkg-config \
+            libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libssl-dev libglib2.0-dev \
+            libayatana-appindicator3-dev
+
+      - name: Install Rust target
+        run: rustup target add x86_64-unknown-linux-gnu
+
+      - name: Build sc-agent (Linux x86_64)
+        run: |
+          cargo build --manifest-path server/Cargo.toml \
+            --package sc-agent --release --target x86_64-unknown-linux-gnu
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sc-agent-linux-x86_64
+          path: server/target/x86_64-unknown-linux-gnu/release/sc-agent
+          retention-days: 1
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Linux aarch64 build — uses `cross` (Docker-based) with its own
+  # target directory to avoid GLIBC mismatch with the host.
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  build-linux-arm:
+    runs-on: [self-hosted, actions-screencontrol]
+    steps:
+      - name: Install Git LFS
+        run: |
+          if ! command -v git-lfs &>/dev/null; then
+            curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
+            sudo apt-get install -y git-lfs
+          fi
+          git lfs install
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install cross
+        run: |
+          if ! command -v cross &>/dev/null; then
+            cargo install cross --git https://github.com/cross-rs/cross
+          fi
+
+      - name: Install Rust target
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Clean cross target directory
+        run: |
+          # cross needs its own clean target dir to avoid GLIBC mismatch
+          # with build scripts compiled on the host
+          rm -rf server/target/aarch64-unknown-linux-gnu
+
+      - name: Build sc-agent (Linux aarch64)
+        working-directory: server
+        run: |
+          cross build --package sc-agent --release \
+            --target aarch64-unknown-linux-gnu
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sc-agent-linux-aarch64
+          path: server/target/aarch64-unknown-linux-gnu/release/sc-agent
+          retention-days: 1
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # macOS builds — uses osxcross toolchain for cross-compilation
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  build-macos:
+    runs-on: [self-hosted, actions-screencontrol]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            artifact: sc-agent-macos-x86_64
+          - target: aarch64-apple-darwin
+            artifact: sc-agent-macos-aarch64
 
     env:
       OSXCROSS_ROOT: /tmp/osxcross
@@ -31,36 +135,21 @@ jobs:
         with:
           lfs: true
 
-      # ── System dependencies ────────────────────────────────────
-
       - name: Install system dependencies
         run: |
-          # Clean up stale arm64 architecture from previous runs (Ubuntu 25.10 lacks arm64 repos)
+          # Clean up stale arm64 architecture from previous CI runs
           sudo dpkg --remove-architecture arm64 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y \
-            protobuf-compiler \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            gcc-mingw-w64-x86-64 \
+            protobuf-compiler pkg-config \
             clang llvm-dev libxml2-dev uuid-dev \
             libssl-dev bash patch make tar xz-utils \
-            bzip2 gzip cpio libbz2-dev zlib1g-dev cmake \
-            pkg-config
+            bzip2 gzip cpio libbz2-dev zlib1g-dev cmake
 
-      - name: Install cross (for Docker-based cross-compilation)
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
 
-      - name: Install Rust targets
-        run: |
-          rustup target add x86_64-unknown-linux-gnu
-          rustup target add aarch64-unknown-linux-gnu
-          rustup target add x86_64-apple-darwin
-          rustup target add aarch64-apple-darwin
-          rustup target add x86_64-pc-windows-gnu
-
-      # ── osxcross setup ─────────────────────────────────────────
-
+      # ── osxcross setup ─────────────────────────────────
       - name: Cache osxcross toolchain
         id: osxcross-cache
         uses: actions/cache@v4
@@ -72,31 +161,23 @@ jobs:
         if: steps.osxcross-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-
-          # Clean up any leftover state from previous failed runs
           rm -rf /tmp/osxcross-src
 
-          # Debug: show what's in sdk/
           echo "━━━ Contents of sdk/ ━━━"
           ls -lh sdk/ || true
 
           # Verify the SDK tarball is real data (not an LFS pointer)
           for f in sdk/MacOSX*.sdk.tar.*; do
             if [ -f "$f" ]; then
-              FIRST_BYTES=$(head -c 4 "$f" | xxd -p 2>/dev/null || echo "unknown")
               SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
-              echo "  $f: $SIZE bytes, magic: $FIRST_BYTES"
+              echo "  $f: $SIZE bytes"
               if [ "$SIZE" -lt 1000000 ]; then
-                echo "  ⚠️  File is suspiciously small — may be an LFS pointer"
-                cat "$f"
-                echo ""
-                echo "  Attempting git lfs pull..."
-                git lfs pull || true
+                echo "  ⚠️  File too small — likely an LFS pointer. Pulling..."
+                git lfs pull
               fi
             fi
           done
 
-          # Find SDK tarballs
           SDK_TARBALLS=$(find sdk/ -maxdepth 1 -name 'MacOSX*.sdk.tar.*' -size +1M 2>/dev/null || true)
           if [ -z "$SDK_TARBALLS" ]; then
             echo "❌ No valid MacOSX SDK tarballs found in sdk/"
@@ -105,128 +186,169 @@ jobs:
           echo "━━━ Building osxcross with: ━━━"
           echo "$SDK_TARBALLS"
 
-          # Clone osxcross
           git clone --depth=1 https://github.com/tpoechtrager/osxcross.git /tmp/osxcross-src
 
-          # Copy SDK tarballs
           for tarball in $SDK_TARBALLS; do
             cp "$tarball" /tmp/osxcross-src/tarballs/
             echo "  → copied $(basename "$tarball")"
           done
 
-          # Build osxcross (non-interactive)
           cd /tmp/osxcross-src
           UNATTENDED=1 ./build.sh
 
-          # Move the built toolchain to the cache path
           mkdir -p "$OSXCROSS_ROOT"
           cp -r /tmp/osxcross-src/target/* "$OSXCROSS_ROOT/"
+          rm -rf /tmp/osxcross-src
 
           echo "✅ osxcross built successfully"
           ls "$OSXCROSS_ROOT/bin/" | head -20
 
-      - name: Verify osxcross
-        run: |
-          echo "osxcross bin contents:"
-          ls "$OSXCROSS_ROOT/bin/" | grep -E "(clang|ar)" | head -10
-          # Find the actual binary prefix (may include SDK version)
-          DARWIN_PREFIX=$(ls "$OSXCROSS_ROOT/bin/" | grep -oP '^[a-z0-9_]+-apple-darwin[0-9.]*' | head -1)
-          echo "darwin_prefix=$DARWIN_PREFIX" >> "$GITHUB_ENV"
-          echo "Detected Darwin prefix: $DARWIN_PREFIX"
-
-      # ── Configure Cargo linkers ────────────────────────────────
-
-      - name: Configure Cargo cross-linkers
+      - name: Configure Cargo cross-linker
         run: |
           mkdir -p ~/.cargo
 
-          # Determine the osxcross clang wrapper names
-          X86_CLANG=$(ls "$OSXCROSS_ROOT/bin/" | grep 'x86_64-apple-darwin.*-clang$' | head -1)
-          ARM_CLANG=$(ls "$OSXCROSS_ROOT/bin/" | grep 'aarch64-apple-darwin.*-clang$' | head -1)
-          X86_AR=$(ls "$OSXCROSS_ROOT/bin/" | grep 'x86_64-apple-darwin.*-ar$' | head -1)
-          ARM_AR=$(ls "$OSXCROSS_ROOT/bin/" | grep 'aarch64-apple-darwin.*-ar$' | head -1)
+          # Find the clang/ar wrappers for this target's arch
+          ARCH=$(echo "${{ matrix.target }}" | cut -d- -f1)
+          CLANG=$(ls "$OSXCROSS_ROOT/bin/" | grep "${ARCH}-apple-darwin.*-clang$" | head -1)
+          AR=$(ls "$OSXCROSS_ROOT/bin/" | grep "${ARCH}-apple-darwin.*-ar$" | head -1)
 
-          cat > ~/.cargo/config.toml << TOML
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
+          if [ -z "$CLANG" ] || [ -z "$AR" ]; then
+            echo "❌ Could not find osxcross wrappers for $ARCH"
+            ls "$OSXCROSS_ROOT/bin/"
+            exit 1
+          fi
+
+          # Append to cargo config (don't overwrite — other jobs may have written it)
+          cat >> ~/.cargo/config.toml << TOML
+
+          [target.${{ matrix.target }}]
+          linker = "${OSXCROSS_ROOT}/bin/${CLANG}"
+          ar = "${OSXCROSS_ROOT}/bin/${AR}"
+          TOML
+
+          echo "✅ Cargo config for ${{ matrix.target }}:"
+          cat ~/.cargo/config.toml
+
+      - name: Build sc-agent (${{ matrix.target }})
+        env:
+          PATH: /tmp/osxcross/bin:${{ env.PATH }}
+          # Tell pkg-config to not look for libs (macOS deps are in the SDK)
+          PKG_CONFIG_ALLOW_CROSS: 1
+        run: |
+          cargo build --manifest-path server/Cargo.toml \
+            --package sc-agent --release --target ${{ matrix.target }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: server/target/${{ matrix.target }}/release/sc-agent
+          retention-days: 1
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Windows x86_64 build — uses mingw-w64 cross-compiler
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  build-windows:
+    runs-on: [self-hosted, actions-screencontrol]
+    steps:
+      - name: Install Git LFS
+        run: |
+          if ! command -v git-lfs &>/dev/null; then
+            curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
+            sudo apt-get install -y git-lfs
+          fi
+          git lfs install
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install system dependencies
+        run: |
+          # Clean up stale arm64 architecture from previous CI runs
+          sudo dpkg --remove-architecture arm64 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler pkg-config \
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+
+      - name: Install Rust target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Configure Cargo linker
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml << 'TOML'
 
           [target.x86_64-pc-windows-gnu]
           linker = "x86_64-w64-mingw32-gcc"
-
-          [target.x86_64-apple-darwin]
-          linker = "${OSXCROSS_ROOT}/bin/${X86_CLANG}"
-          ar = "${OSXCROSS_ROOT}/bin/${X86_AR}"
-
-          [target.aarch64-apple-darwin]
-          linker = "${OSXCROSS_ROOT}/bin/${ARM_CLANG}"
-          ar = "${OSXCROSS_ROOT}/bin/${ARM_AR}"
           TOML
-
-          echo "✅ Cargo config written:"
-          cat ~/.cargo/config.toml
-
-      # ── Build all targets ──────────────────────────────────────
-
-      - name: Build sc-agent (Linux x86_64)
-        run: |
-          cargo build --manifest-path server/Cargo.toml \
-            --package sc-agent --release --target x86_64-unknown-linux-gnu
-
-      - name: Build sc-agent (Linux aarch64)
-        run: |
-          cross build --manifest-path server/Cargo.toml \
-            --package sc-agent --release --target aarch64-unknown-linux-gnu
-
-      - name: Build sc-agent (macOS x86_64)
-        env:
-          PATH: /tmp/osxcross/bin:/usr/bin:/bin:${{ env.PATH }}
-        run: |
-          cargo build --manifest-path server/Cargo.toml \
-            --package sc-agent --release --target x86_64-apple-darwin
-
-      - name: Build sc-agent (macOS aarch64)
-        env:
-          PATH: /tmp/osxcross/bin:/usr/bin:/bin:${{ env.PATH }}
-        run: |
-          cargo build --manifest-path server/Cargo.toml \
-            --package sc-agent --release --target aarch64-apple-darwin
 
       - name: Build sc-agent (Windows x86_64)
         run: |
           cargo build --manifest-path server/Cargo.toml \
             --package sc-agent --release --target x86_64-pc-windows-gnu
 
-      # ── Collect binaries & generate manifest ───────────────────
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sc-agent-windows-x86_64
+          path: server/target/x86_64-pc-windows-gnu/release/sc-agent.exe
+          retention-days: 1
 
-      - name: Collect agent binaries
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Collect all binaries and publish
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  collect:
+    runs-on: [self-hosted, actions-screencontrol]
+    needs: [build-linux-x86, build-linux-arm, build-macos, build-windows]
+    if: always()
+
+    steps:
+      - name: Checkout (for version info)
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect and rename binaries
         run: |
-          BUILD_DIR="server/agent-builds"
-          TARGET_DIR="server/target"
-          mkdir -p "$BUILD_DIR"
+          mkdir -p server/agent-builds
 
           declare -A TARGETS=(
-            ["x86_64-unknown-linux-gnu"]="sc-agent-linux-x86_64"
-            ["aarch64-unknown-linux-gnu"]="sc-agent-linux-aarch64"
-            ["x86_64-apple-darwin"]="sc-agent-macos-x86_64"
-            ["aarch64-apple-darwin"]="sc-agent-macos-aarch64"
-            ["x86_64-pc-windows-gnu"]="sc-agent-windows-x86_64.exe"
+            ["sc-agent-linux-x86_64"]="sc-agent-linux-x86_64"
+            ["sc-agent-linux-aarch64"]="sc-agent-linux-aarch64"
+            ["sc-agent-macos-x86_64"]="sc-agent-macos-x86_64"
+            ["sc-agent-macos-aarch64"]="sc-agent-macos-aarch64"
+            ["sc-agent-windows-x86_64"]="sc-agent-windows-x86_64.exe"
           )
 
-          for triple in "${!TARGETS[@]}"; do
-            output="${TARGETS[$triple]}"
-            bin_name="sc-agent"
-            [[ "$triple" == *windows* ]] && bin_name="sc-agent.exe"
-            src="$TARGET_DIR/$triple/release/$bin_name"
-
-            if [ -f "$src" ]; then
-              cp "$src" "$BUILD_DIR/$output"
-              chmod +x "$BUILD_DIR/$output" 2>/dev/null || true
-              SIZE=$(stat -c%s "$BUILD_DIR/$output")
-              echo "✅ $output ($SIZE bytes)"
+          for artifact_name in "${!TARGETS[@]}"; do
+            output="${TARGETS[$artifact_name]}"
+            # Find the binary in the downloaded artifact directory
+            src_dir="artifacts/$artifact_name"
+            if [ -d "$src_dir" ]; then
+              # Find the actual binary (may be sc-agent or sc-agent.exe)
+              bin=$(find "$src_dir" -type f \( -name "sc-agent" -o -name "sc-agent.exe" \) | head -1)
+              if [ -n "$bin" ]; then
+                cp "$bin" "server/agent-builds/$output"
+                chmod +x "server/agent-builds/$output" 2>/dev/null || true
+                SIZE=$(stat -c%s "server/agent-builds/$output" 2>/dev/null || stat -f%z "server/agent-builds/$output")
+                echo "✅ $output ($SIZE bytes)"
+              else
+                echo "⚠️  No sc-agent binary found in $src_dir"
+              fi
             else
-              echo "⚠️  $output not found — build may have failed"
+              echo "⚠️  Artifact $artifact_name not available (build may have failed)"
             fi
           done
+
+          echo ""
+          echo "━━━ Final agent-builds/ contents: ━━━"
+          ls -lh server/agent-builds/
 
       - name: Generate manifest.json
         run: |
@@ -278,17 +400,14 @@ jobs:
               print(f"   {k}: {v['file']} ({v['size']} bytes)")
           PYEOF
 
-      # ── Upload artifacts ───────────────────────────────────────
-
-      - name: Upload agent binaries
+      - name: Upload combined agent builds
         uses: actions/upload-artifact@v4
         with:
           name: agent-builds
           path: server/agent-builds/
           retention-days: 30
 
-      # ── GitHub Release (on tag push only) ──────────────────────
-
+      # ── GitHub Release (on tag push only) ─────────────
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
