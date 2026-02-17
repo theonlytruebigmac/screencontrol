@@ -235,11 +235,11 @@ jobs:
       # ── Swift toolchain (needed by screencapturekit crate's build.rs) ──
       - name: Install Swift runtime dependencies
         run: |
-          # swift-build binary needs libxml2.so.2, libcurl, etc. at runtime
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libxml2 libcurl4-openssl-dev libncurses5 libedit2 \
-            libsqlite3-0 libpython3-dev libz3-dev
+          # swift-build binary needs libxml2.so.2, libcurl, etc. at runtime.
+          # Most are already installed from the "Install system dependencies" step.
+          # libxml2-dev provides libxml2.so.2; we only need a few extras for Swift.
+          sudo apt-get install -y \
+            libncurses-dev libedit-dev libsqlite3-dev libz3-dev 2>/dev/null || true
 
       - name: Cache Swift toolchain
         id: swift-cache
