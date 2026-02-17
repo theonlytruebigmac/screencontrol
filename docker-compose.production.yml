@@ -1,0 +1,161 @@
+services:
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # PostgreSQL
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  postgres:
+    container_name: sc-postgres
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-screencontrol}
+      POSTGRES_USER: ${POSTGRES_USER:-screencontrol}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - sc_internal
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-screencontrol}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Redis
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  redis:
+    container_name: sc-redis
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD:-changeme}
+    volumes:
+      - redisdata:/data
+    networks:
+      - sc_internal
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # MinIO (S3-compatible object storage)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  minio:
+    container_name: sc-minio
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-screencontrol}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - miniodata:/data
+    networks:
+      - sc_internal
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # ScreenControl Server (API + WebSocket)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  sc-server:
+    container_name: sc-server
+    image: ghcr.io/theonlytruebigmac/screencontrol/server:latest
+    environment:
+      SC__SERVER__HOST: "0.0.0.0"
+      SC__SERVER__API_PORT: "8080"
+      SC__SERVER__LOG_LEVEL: ${LOG_LEVEL:-info}
+      SC__DATABASE__URL: "postgres://${POSTGRES_USER:-screencontrol}:${POSTGRES_PASSWORD:?err}@sc-postgres:5432/${POSTGRES_DB:-screencontrol}"
+      SC__DATABASE__MAX_CONNECTIONS: "20"
+      SC__REDIS__URL: "redis://:${REDIS_PASSWORD:-changeme}@sc-redis:6379"
+      SC__AUTH__JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      SC__AUTH__ACCESS_TOKEN_TTL_SECS: "3600"
+      SC__AUTH__REFRESH_TOKEN_TTL_SECS: "604800"
+      SC__S3__ENDPOINT: "http://sc-minio:9000"
+      SC__S3__PUBLIC_ENDPOINT: "https://${SC_SUBDOMAIN:-sc}.${SC_DOMAIN:-syschimp.com}/s3"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-screencontrol}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?err}
+      AWS_REGION: "us-east-1"
+    networks:
+      - t3_proxy
+      - sc_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    labels:
+      traefik.enable: true
+      traefik.docker.network: t3_proxy
+      # ─── API + WebSocket router ──────────────────────────────
+      traefik.http.routers.sc-server.entrypoints: websecure
+      traefik.http.routers.sc-server.rule: >-
+        Host(`${SC_SUBDOMAIN:-sc}.${SC_DOMAIN:-syschimp.com}`) && (PathPrefix(`/api`) || PathPrefix(`/ws`))
+      traefik.http.routers.sc-server.tls: true
+      traefik.http.routers.sc-server.tls.certresolver: dns-cloudflare
+      traefik.http.routers.sc-server.middlewares: chain-no-auth@file
+      traefik.http.routers.sc-server.service: sc-server-svc
+      traefik.http.services.sc-server-svc.loadbalancer.server.port: 8080
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # ScreenControl Relay (TCP signaling/data relay)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  sc-relay:
+    container_name: sc-relay
+    image: ghcr.io/theonlytruebigmac/screencontrol/relay:latest
+    environment:
+      SC_RELAY_PORT: "8041"
+    # Relay is raw TCP — expose directly (no HTTP/TLS needed)
+    ports:
+      - "8041:8041"
+    networks:
+      - sc_internal
+    restart: unless-stopped
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Web Console (Next.js)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  web:
+    container_name: sc-web
+    image: ghcr.io/theonlytruebigmac/screencontrol/web:latest
+    environment:
+      NEXT_PUBLIC_API_URL: "https://${SC_SUBDOMAIN:-sc}.${SC_DOMAIN:-syschimp.com}/api"
+      NEXT_PUBLIC_WS_URL: "wss://${SC_SUBDOMAIN:-sc}.${SC_DOMAIN:-syschimp.com}/ws"
+    networks:
+      - t3_proxy
+      - sc_internal
+    depends_on:
+      - sc-server
+    restart: unless-stopped
+    labels:
+      traefik.enable: true
+      traefik.docker.network: t3_proxy
+      # ─── Web console catch-all ───────────────────────────────
+      traefik.http.routers.sc-web.entrypoints: websecure
+      traefik.http.routers.sc-web.rule: Host(`${SC_SUBDOMAIN:-sc}.${SC_DOMAIN:-syschimp.com}`)
+      traefik.http.routers.sc-web.tls: true
+      traefik.http.routers.sc-web.tls.certresolver: dns-cloudflare
+      traefik.http.routers.sc-web.middlewares: chain-no-auth@file
+      traefik.http.routers.sc-web.service: sc-web-svc
+      # Lower priority so /api and /ws match sc-server first
+      traefik.http.routers.sc-web.priority: "1"
+      traefik.http.services.sc-web-svc.loadbalancer.server.port: 3000
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+networks:
+  t3_proxy:
+    external: true
+  sc_internal:
+    name: sc_internal
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
