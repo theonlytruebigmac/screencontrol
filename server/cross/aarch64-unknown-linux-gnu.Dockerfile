@@ -34,7 +34,10 @@ RUN dpkg --add-architecture arm64 && \
     libssl-dev:arm64 \
     libgtk-3-dev:arm64 \
     libwebkit2gtk-4.0-dev:arm64 \
+    libwebkit2gtk-4.1-dev:arm64 \
+    libjavascriptcoregtk-4.1-dev:arm64 \
     libsoup2.4-dev:arm64 \
+    libsoup-3.0-dev:arm64 \
     && ( apt-get install -y --no-install-recommends libayatana-appindicator3-dev:arm64 \
     || apt-get install -y --no-install-recommends libappindicator3-dev:arm64 \
     || true ) \
