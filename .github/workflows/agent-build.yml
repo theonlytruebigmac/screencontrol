@@ -60,8 +60,9 @@ jobs:
           retention-days: 1
 
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  # Linux aarch64 build — uses `cross` (Docker-based) with its own
-  # target directory to avoid GLIBC mismatch with the host.
+  # Linux aarch64 build — Docker-native cross-compilation.
+  # Uses a self-contained Ubuntu 22.04 image with Rust installed
+  # inside (avoids glibc mismatch between host and container).
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   build-linux-arm:
     runs-on: [self-hosted, actions-screencontrol]
@@ -79,41 +80,43 @@ jobs:
         with:
           lfs: true
 
-      - name: Install cross
+      - name: Build Docker cross-compilation image
         run: |
-          if ! command -v cross &>/dev/null; then
-            cargo install cross --git https://github.com/cross-rs/cross
-          fi
-
-      - name: Install Rust target
-        run: rustup target add aarch64-unknown-linux-gnu
-
-      - name: Clean stale state
-        run: |
-          # Remove stale cargo config from other parallel jobs
-          rm -f ~/.cargo/config.toml
-          # cross needs a clean target dir to avoid GLIBC mismatch
-          rm -rf server/target/aarch64-unknown-linux-gnu
-
-      - name: Copy proto files into server tree
-        run: |
-          # cross mounts only the cargo workspace root (server/) into Docker.
-          # sc-protocol's build.rs references ../../../proto/ which escapes
-          # the mount. The updated build.rs also checks ../../proto/ as a
-          # fallback, so we copy proto/ into server/proto/ for cross builds.
-          cp -r proto/ server/proto/
+          docker build -t sc-agent-arm64-builder \
+            -f server/cross/aarch64-unknown-linux-gnu.Dockerfile \
+            server/cross/
 
       - name: Build sc-agent (Linux aarch64)
-        working-directory: server
         run: |
-          cross build --package sc-agent --release \
-            --target aarch64-unknown-linux-gnu
+          # Clean up any previous build volume
+          docker volume rm sc-agent-arm64-build 2>/dev/null || true
+          # Build inside Docker with source mounted read-only.
+          # Named volume persists the cargo target dir for extraction.
+          docker run --rm \
+            -v "${{ github.workspace }}:/src:ro" \
+            -v sc-agent-arm64-cargo-cache:/root/.cargo/registry \
+            -v sc-agent-arm64-build:/build \
+            -w /build \
+            sc-agent-arm64-builder \
+            bash -c '
+              cp -r /src/server/. . &&
+              mkdir -p proto && cp -r /src/proto/. proto/ &&
+              cargo build --package sc-agent --release \
+                --target aarch64-unknown-linux-gnu
+            '
+          # Extract binary from the named volume
+          docker run --rm \
+            -v sc-agent-arm64-build:/build:ro \
+            -v "${{ github.workspace }}:/out" \
+            ubuntu:22.04 \
+            cp /build/target/aarch64-unknown-linux-gnu/release/sc-agent \
+               /out/sc-agent-linux-aarch64
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: sc-agent-linux-aarch64
-          path: server/target/aarch64-unknown-linux-gnu/release/sc-agent
+          path: sc-agent-linux-aarch64
           retention-days: 1
 
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
