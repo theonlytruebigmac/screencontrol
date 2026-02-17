@@ -326,6 +326,21 @@ jobs:
           printf '#!/bin/bash\nREAL_SWIFT="/tmp/swift-toolchain/usr/bin/swift"\nif [ "$1" = "build" ]; then\n  shift\n  exec "$REAL_SWIFT" build --triple %s --sdk "%s" "$@"\nelse\n  exec "$REAL_SWIFT" "$@"\nfi\n' "${SWIFT_TARGET}" "${SDKROOT}" > /tmp/swift-wrapper/swift
           chmod +x /tmp/swift-wrapper/swift
 
+          # Create libtool wrapper — Swift's build system needs macOS libtool
+          # to create static libraries. osxcross provides it as <arch>-apple-darwin*-libtool.
+          OSXCROSS_LIBTOOL=$(ls "$OSXCROSS_ROOT/bin/" | grep "apple-darwin.*-libtool$" | head -1)
+          if [ -n "$OSXCROSS_LIBTOOL" ]; then
+            printf '#!/bin/bash\nexec "%s/bin/%s" "$@"\n' "$OSXCROSS_ROOT" "$OSXCROSS_LIBTOOL" > /tmp/swift-wrapper/libtool
+            chmod +x /tmp/swift-wrapper/libtool
+            echo "✅ Created libtool wrapper -> $OSXCROSS_LIBTOOL"
+          else
+            # Fallback: use llvm-libtool-darwin if available, or create a stub
+            # that uses ar as a fallback
+            printf '#!/bin/bash\n# Stub libtool that delegates to ar for static libs\nif echo "$@" | grep -q "\\-static"; then\n  ar rcs "$@"\nelse\n  exec /usr/bin/libtool "$@" 2>/dev/null || ar rcs "$@"\nfi\n' > /tmp/swift-wrapper/libtool
+            chmod +x /tmp/swift-wrapper/libtool
+            echo "⚠️ No osxcross libtool found, using ar fallback"
+          fi
+
           echo "Swift wrapper contents:"
           cat /tmp/swift-wrapper/swift
 
