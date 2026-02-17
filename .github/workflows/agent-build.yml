@@ -95,6 +95,14 @@ jobs:
           # cross needs a clean target dir to avoid GLIBC mismatch
           rm -rf server/target/aarch64-unknown-linux-gnu
 
+      - name: Copy proto files into server tree
+        run: |
+          # cross mounts only the cargo workspace root (server/) into Docker.
+          # sc-protocol's build.rs references ../../../proto/ which escapes
+          # the mount. The updated build.rs also checks ../../proto/ as a
+          # fallback, so we copy proto/ into server/proto/ for cross builds.
+          cp -r proto/ server/proto/
+
       - name: Build sc-agent (Linux aarch64)
         working-directory: server
         run: |
@@ -235,9 +243,22 @@ jobs:
       # ── Swift toolchain (needed by screencapturekit crate's build.rs) ──
       - name: Install Swift runtime dependencies
         run: |
-          # swift-build binary needs libxml2.so.2, libcurl, etc. at runtime.
-          # Most are already installed from the "Install system dependencies" step.
-          # libxml2-dev provides libxml2.so.2; we only need a few extras for Swift.
+          # swift-build binary (from Ubuntu 24.04) needs libxml2.so.2 at runtime.
+          # On Ubuntu 25.10, the library exists but may have a different soname.
+          # Create a symlink if libxml2.so.2 doesn't exist.
+          if [ ! -f /usr/lib/x86_64-linux-gnu/libxml2.so.2 ]; then
+            LIBXML2=$(find /usr/lib -name 'libxml2.so*' -not -name '*.a' 2>/dev/null | head -1)
+            if [ -n "$LIBXML2" ]; then
+              sudo ln -sf "$LIBXML2" /usr/lib/x86_64-linux-gnu/libxml2.so.2
+              echo "✅ Created symlink: /usr/lib/x86_64-linux-gnu/libxml2.so.2 -> $LIBXML2"
+            else
+              echo "⚠️ libxml2.so not found, attempting to install..."
+              sudo apt-get update && sudo apt-get install -y libxml2-dev || true
+            fi
+          else
+            echo "✅ libxml2.so.2 already exists"
+          fi
+          # Additional Swift runtime deps
           sudo apt-get install -y \
             libncurses-dev libedit-dev libsqlite3-dev libz3-dev 2>/dev/null || true
 
