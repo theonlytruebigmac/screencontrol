@@ -1836,17 +1836,18 @@ mod windows {
     use std::sync::Arc;
 
     use image::codecs::jpeg::JpegEncoder;
-    use image::ExtendedColorType;
+    use image::{ExtendedColorType, ImageEncoder};
     use prost::Message as ProstMessage;
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
-    use windows_capture::capture::{CaptureControl, GraphicsCaptureApiHandler};
+    use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
     use windows_capture::frame::Frame;
     use windows_capture::graphics_capture_api::InternalCaptureControl;
     use windows_capture::monitor::Monitor;
     use windows_capture::settings::{
-        ColorFormat, CursorCaptureSettings, DrawBorderSettings, Settings,
+        ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+        MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     };
 
     use sc_protocol::{envelope, DesktopFrame, Envelope, FrameCodec};
@@ -2014,9 +2015,8 @@ mod windows {
         );
         type Error = Box<dyn std::error::Error + Send + Sync>;
 
-        fn new(
-            (ws_tx, session_id, ffmpeg_path, quality_config): Self::Flags,
-        ) -> Result<Self, Self::Error> {
+        fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+            let (ws_tx, session_id, ffmpeg_path, quality_config) = ctx.flags;
             Ok(Self {
                 ws_tx,
                 session_id,
@@ -2030,7 +2030,7 @@ mod windows {
 
         fn on_frame_arrived(
             &mut self,
-            frame: &mut Frame,
+            frame: &mut Frame<'_>,
             capture_control: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
             if self.ws_tx.is_closed() {
@@ -2165,6 +2165,9 @@ mod windows {
             monitor,
             CursorCaptureSettings::WithCursor,
             DrawBorderSettings::WithoutBorder,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::default(),
+            DirtyRegionSettings::default(),
             ColorFormat::Bgra8,
             (ws_tx, session_id.clone(), ffmpeg_path, quality_config),
         );

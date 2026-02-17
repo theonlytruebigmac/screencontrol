@@ -56,3 +56,4 @@ screencapturekit = { version = "1.5", features = ["async"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "1"
 windows-service = "0.7"
+zip = "2"

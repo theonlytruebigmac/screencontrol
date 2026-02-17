@@ -116,8 +116,8 @@ fn main() -> anyhow::Result<()> {
         sys_info.arch
     );
 
-    let unattended = std::env::var("SC_UNATTENDED").unwrap_or_default() == "1"
-        || unsafe { libc::getppid() } == 1;
+    let unattended =
+        std::env::var("SC_UNATTENDED").unwrap_or_default() == "1" || is_orphan_process();
 
     if unattended {
         // ── Headless / service mode — no GUI, run tokio on main thread ──
@@ -239,6 +239,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Check if the process is an orphan (parent PID == 1, i.e. adopted by init/launchd).
+/// On Windows, `getppid` is not available — we always return `false`.
+#[cfg(unix)]
+fn is_orphan_process() -> bool {
+    (unsafe { libc::getppid() }) == 1
+}
+
+#[cfg(not(unix))]
+fn is_orphan_process() -> bool {
+    false
 }
 
 /// Parse `--server-url`, `--token`, `--group` flags from install arguments.
