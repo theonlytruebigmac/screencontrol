@@ -232,12 +232,34 @@ jobs:
           echo "✅ Cargo config for ${{ matrix.target }}:"
           cat ~/.cargo/config.toml
 
+      # ── Swift toolchain (needed by screencapturekit crate's build.rs) ──
+      - name: Cache Swift toolchain
+        id: swift-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/swift-toolchain
+          key: swift-6.1-ubuntu-${{ runner.os }}
+
+      - name: Install Swift toolchain
+        if: steps.swift-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/swift-toolchain
+
+          # Download Swift for Linux (used to cross-compile the Swift bridge in screencapturekit)
+          SWIFT_URL="https://download.swift.org/swift-6.1-release/ubuntu2404/swift-6.1-RELEASE/swift-6.1-RELEASE-ubuntu24.04.tar.gz"
+          echo "Downloading Swift from $SWIFT_URL ..."
+          curl -fsSL "$SWIFT_URL" | tar xz -C /tmp/swift-toolchain --strip-components=1
+
+          echo "✅ Swift installed:"
+          /tmp/swift-toolchain/usr/bin/swift --version
+
       - name: Build sc-agent (${{ matrix.target }})
         env:
           # Tell pkg-config to not look for libs (macOS deps are in the SDK)
           PKG_CONFIG_ALLOW_CROSS: 1
         run: |
-          export PATH="/tmp/osxcross/bin:$PATH"
+          export PATH="/tmp/osxcross/bin:/tmp/swift-toolchain/usr/bin:$PATH"
 
           # Point cc-rs at osxcross clang for the macOS *target* only.
           # Using target-specific CC_<target> vars so we don't leak osxcross
@@ -250,6 +272,32 @@ jobs:
           TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
           export "CC_${TARGET_ENV}=${OSXCROSS_ROOT}/bin/${CLANG}"
           export "AR_${TARGET_ENV}=${OSXCROSS_ROOT}/bin/${AR_BIN}"
+
+          # Set SDKROOT so the screencapturekit build.rs can find macOS frameworks
+          # when running `swift build`
+          SDK_DIR=$(find "$OSXCROSS_ROOT/SDK" -maxdepth 1 -name 'MacOSX*.sdk' | head -1)
+          export SDKROOT="$SDK_DIR"
+          echo "SDKROOT=$SDKROOT"
+
+          # Determine the Swift target triple for this architecture
+          if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            SWIFT_TARGET="arm64-apple-macosx13.0"
+          else
+            SWIFT_TARGET="x86_64-apple-macosx13.0"
+          fi
+
+          # Create a swift wrapper that injects cross-compilation flags.
+          # The screencapturekit build.rs calls `swift build -c release ...`
+          # without any cross-compile args, so we intercept and add them.
+          mkdir -p /tmp/swift-wrapper
+          printf '#!/bin/bash\nREAL_SWIFT="/tmp/swift-toolchain/usr/bin/swift"\nif [ "$1" = "build" ]; then\n  shift\n  exec "$REAL_SWIFT" build --triple %s --sdk "%s" "$@"\nelse\n  exec "$REAL_SWIFT" "$@"\nfi\n' "${SWIFT_TARGET}" "${SDKROOT}" > /tmp/swift-wrapper/swift
+          chmod +x /tmp/swift-wrapper/swift
+
+          echo "Swift wrapper contents:"
+          cat /tmp/swift-wrapper/swift
+
+          # Put the wrapper first in PATH so screencapturekit's build.rs uses it
+          export PATH="/tmp/swift-wrapper:$PATH"
 
           cargo build --manifest-path server/Cargo.toml \
             --package sc-agent --release --target ${{ matrix.target }}
