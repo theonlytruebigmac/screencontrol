@@ -905,6 +905,7 @@ mod macos {
     /// Feeds raw BGRA frames from SCK to FFmpeg's hardware H264 encoder via stdin,
     /// reads Annex B H264 stream from stdout in a background thread.
     /// Falls back to JPEG encoding if FFmpeg is not available.
+    #[cfg(feature = "sck")]
     async fn capture_with_screencapturekit(
         session_id: &str,
         _monitor_index: u32,
@@ -1804,24 +1805,32 @@ mod macos {
         }
 
         // Try ScreenCaptureKit first (macOS 12.3+), fall back to CoreGraphics
-        tracing::info!(
-            "Attempting ScreenCaptureKit capture for session {}",
-            session_id
-        );
-        match capture_with_screencapturekit(&session_id, monitor_index, &ws_tx, &quality_config)
-            .await
+        #[cfg(feature = "sck")]
         {
-            Ok(()) => {
-                tracing::info!("ScreenCaptureKit session ended normally: {}", session_id);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "ScreenCaptureKit failed ({}), falling back to CoreGraphics",
-                    e
-                );
-                capture_with_coregraphics(&session_id, &ws_tx, &quality_config).await;
+            tracing::info!(
+                "Attempting ScreenCaptureKit capture for session {}",
+                session_id
+            );
+            match capture_with_screencapturekit(&session_id, monitor_index, &ws_tx, &quality_config)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!("ScreenCaptureKit session ended normally: {}", session_id);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "ScreenCaptureKit failed ({}), falling back to CoreGraphics",
+                        e
+                    );
+                }
             }
         }
+
+        #[cfg(not(feature = "sck"))]
+        tracing::info!("SCK feature disabled, using CoreGraphics for session {}", session_id);
+
+        capture_with_coregraphics(&session_id, &ws_tx, &quality_config).await;
     }
 }
 

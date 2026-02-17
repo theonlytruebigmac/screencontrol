@@ -46,12 +46,16 @@ futures-util = "0.3"
 # JPEG encoding for screen capture frames (macOS/Windows use raw pixel buffers)
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
+[features]
+default = ["sck"]
+sck = ["screencapturekit"]
+
 # Screen capture (platform-specific)
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = { version = "1.5", features = ["async"] }
+screencapturekit = { version = "1.5", features = ["async"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "1"
