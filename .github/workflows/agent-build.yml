@@ -120,241 +120,48 @@ jobs:
           retention-days: 1
 
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  # macOS builds — uses osxcross toolchain for cross-compilation
+  # macOS builds — native compilation on self-hosted Apple Silicon runner.
+  # aarch64 compiles natively, x86_64 cross-compiles via Rust.
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   build-macos:
-    runs-on: [self-hosted, actions-screencontrol]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            artifact: sc-agent-macos-x86_64
-          - target: aarch64-apple-darwin
-            artifact: sc-agent-macos-aarch64
-
-    env:
-      OSXCROSS_ROOT: /tmp/osxcross
+    runs-on: [self-hosted, macOS, ARM64]
 
     steps:
-      - name: Install Git LFS
-        run: |
-          if ! command -v git-lfs &>/dev/null; then
-            curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
-            sudo apt-get install -y git-lfs
-          fi
-          git lfs install
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
           lfs: true
 
+      - name: Install Rust targets
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
       - name: Install system dependencies
         run: |
-          # Clean up stale arm64 architecture from previous CI runs
-          sudo dpkg --remove-architecture arm64 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y \
-            protobuf-compiler pkg-config \
-            clang llvm-dev libxml2-dev uuid-dev \
-            libssl-dev bash patch make tar xz-utils \
-            bzip2 gzip cpio libbz2-dev zlib1g-dev cmake
+          brew install protobuf pkg-config 2>/dev/null || true
 
-      - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
-
-      # ── osxcross setup ─────────────────────────────────
-      - name: Cache osxcross toolchain
-        id: osxcross-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/osxcross
-          key: osxcross-${{ hashFiles('sdk/MacOSX*') }}
-
-      - name: Build osxcross from bundled SDK
-        if: steps.osxcross-cache.outputs.cache-hit != 'true'
+      - name: Build sc-agent (x86_64-apple-darwin)
         run: |
-          set -euo pipefail
-          rm -rf /tmp/osxcross-src
-
-          echo "━━━ Contents of sdk/ ━━━"
-          ls -lh sdk/ || true
-
-          # Verify the SDK tarball is real data (not an LFS pointer)
-          for f in sdk/MacOSX*.sdk.tar.*; do
-            if [ -f "$f" ]; then
-              SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
-              echo "  $f: $SIZE bytes"
-              if [ "$SIZE" -lt 1000000 ]; then
-                echo "  ⚠️  File too small — likely an LFS pointer. Pulling..."
-                git lfs pull
-              fi
-            fi
-          done
-
-          SDK_TARBALLS=$(find sdk/ -maxdepth 1 -name 'MacOSX*.sdk.tar.*' -size +1M 2>/dev/null || true)
-          if [ -z "$SDK_TARBALLS" ]; then
-            echo "❌ No valid MacOSX SDK tarballs found in sdk/"
-            exit 1
-          fi
-          echo "━━━ Building osxcross with: ━━━"
-          echo "$SDK_TARBALLS"
-
-          git clone --depth=1 https://github.com/tpoechtrager/osxcross.git /tmp/osxcross-src
-
-          for tarball in $SDK_TARBALLS; do
-            cp "$tarball" /tmp/osxcross-src/tarballs/
-            echo "  → copied $(basename "$tarball")"
-          done
-
-          cd /tmp/osxcross-src
-          UNATTENDED=1 ./build.sh
-
-          mkdir -p "$OSXCROSS_ROOT"
-          cp -r /tmp/osxcross-src/target/* "$OSXCROSS_ROOT/"
-          rm -rf /tmp/osxcross-src
-
-          echo "✅ osxcross built successfully"
-          ls "$OSXCROSS_ROOT/bin/" | head -20
-
-      - name: Configure Cargo cross-linker
-        run: |
-          mkdir -p ~/.cargo
-
-          # Find the clang/ar wrappers for this target's arch
-          ARCH=$(echo "${{ matrix.target }}" | cut -d- -f1)
-          CLANG=$(ls "$OSXCROSS_ROOT/bin/" | grep "${ARCH}-apple-darwin.*-clang$" | head -1)
-          AR=$(ls "$OSXCROSS_ROOT/bin/" | grep "${ARCH}-apple-darwin.*-ar$" | head -1)
-
-          if [ -z "$CLANG" ] || [ -z "$AR" ]; then
-            echo "❌ Could not find osxcross wrappers for $ARCH"
-            ls "$OSXCROSS_ROOT/bin/"
-            exit 1
-          fi
-
-          # Write a FRESH cargo config (overwrite to avoid duplicates from parallel jobs)
-          cat > ~/.cargo/config.toml << TOML
-          [target.${{ matrix.target }}]
-          linker = "${OSXCROSS_ROOT}/bin/${CLANG}"
-          ar = "${OSXCROSS_ROOT}/bin/${AR}"
-          TOML
-
-          echo "✅ Cargo config for ${{ matrix.target }}:"
-          cat ~/.cargo/config.toml
-
-      # ── Swift toolchain (needed by screencapturekit crate's build.rs) ──
-      - name: Install Swift runtime dependencies
-        run: |
-          # swift-build binary (from Ubuntu 24.04) needs libxml2.so.2 at runtime.
-          # On Ubuntu 25.10, the library exists but may have a different soname.
-          # Create a symlink if libxml2.so.2 doesn't exist.
-          if [ ! -f /usr/lib/x86_64-linux-gnu/libxml2.so.2 ]; then
-            LIBXML2=$(find /usr/lib -name 'libxml2.so*' -not -name '*.a' 2>/dev/null | head -1)
-            if [ -n "$LIBXML2" ]; then
-              sudo ln -sf "$LIBXML2" /usr/lib/x86_64-linux-gnu/libxml2.so.2
-              echo "✅ Created symlink: /usr/lib/x86_64-linux-gnu/libxml2.so.2 -> $LIBXML2"
-            else
-              echo "⚠️ libxml2.so not found, attempting to install..."
-              sudo apt-get update && sudo apt-get install -y libxml2-dev || true
-            fi
-          else
-            echo "✅ libxml2.so.2 already exists"
-          fi
-          # Additional Swift runtime deps
-          sudo apt-get install -y \
-            libncurses-dev libedit-dev libsqlite3-dev libz3-dev 2>/dev/null || true
-
-      - name: Cache Swift toolchain
-        id: swift-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/swift-toolchain
-          key: swift-6.1-ubuntu-${{ runner.os }}
-
-      - name: Install Swift toolchain
-        if: steps.swift-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/swift-toolchain
-
-          # Download Swift for Linux (used to cross-compile the Swift bridge in screencapturekit)
-          SWIFT_URL="https://download.swift.org/swift-6.1-release/ubuntu2404/swift-6.1-RELEASE/swift-6.1-RELEASE-ubuntu24.04.tar.gz"
-          echo "Downloading Swift from $SWIFT_URL ..."
-          curl -fsSL "$SWIFT_URL" | tar xz -C /tmp/swift-toolchain --strip-components=1
-
-          echo "✅ Swift installed:"
-          /tmp/swift-toolchain/usr/bin/swift --version
-
-      - name: Build sc-agent (${{ matrix.target }})
-        env:
-          # Tell pkg-config to not look for libs (macOS deps are in the SDK)
-          PKG_CONFIG_ALLOW_CROSS: 1
-        run: |
-          export PATH="/tmp/osxcross/bin:/tmp/swift-toolchain/usr/bin:$PATH"
-          export LD_LIBRARY_PATH="/tmp/swift-toolchain/usr/lib:${LD_LIBRARY_PATH:-}"
-
-          # Point cc-rs at osxcross clang for the macOS *target* only.
-          # Using target-specific CC_<target> vars so we don't leak osxcross
-          # into build scripts that compile for the *host* (e.g. ring).
-          ARCH=$(echo "${{ matrix.target }}" | cut -d- -f1)
-          CLANG=$(ls "$OSXCROSS_ROOT/bin/" | grep "${ARCH}-apple-darwin.*-clang$" | head -1)
-          AR_BIN=$(ls "$OSXCROSS_ROOT/bin/" | grep "${ARCH}-apple-darwin.*-ar$" | head -1)
-
-          # Convert target triple to env-var format: x86_64-apple-darwin -> x86_64_apple_darwin
-          TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
-          export "CC_${TARGET_ENV}=${OSXCROSS_ROOT}/bin/${CLANG}"
-          export "AR_${TARGET_ENV}=${OSXCROSS_ROOT}/bin/${AR_BIN}"
-
-          # Set SDKROOT so the screencapturekit build.rs can find macOS frameworks
-          # when running `swift build`
-          SDK_DIR=$(find "$OSXCROSS_ROOT/SDK" -maxdepth 1 -name 'MacOSX*.sdk' | head -1)
-          export SDKROOT="$SDK_DIR"
-          echo "SDKROOT=$SDKROOT"
-
-          # Determine the Swift target triple for this architecture
-          if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-            SWIFT_TARGET="arm64-apple-macosx13.0"
-          else
-            SWIFT_TARGET="x86_64-apple-macosx13.0"
-          fi
-
-          # Create a swift wrapper that injects cross-compilation flags.
-          # The screencapturekit build.rs calls `swift build -c release ...`
-          # without any cross-compile args, so we intercept and add them.
-          mkdir -p /tmp/swift-wrapper
-          printf '#!/bin/bash\nREAL_SWIFT="/tmp/swift-toolchain/usr/bin/swift"\nif [ "$1" = "build" ]; then\n  shift\n  exec "$REAL_SWIFT" build --triple %s --sdk "%s" "$@"\nelse\n  exec "$REAL_SWIFT" "$@"\nfi\n' "${SWIFT_TARGET}" "${SDKROOT}" > /tmp/swift-wrapper/swift
-          chmod +x /tmp/swift-wrapper/swift
-
-          # Create libtool wrapper — Swift's build system needs macOS libtool
-          # to create static libraries. osxcross provides it as <arch>-apple-darwin*-libtool.
-          OSXCROSS_LIBTOOL=$(ls "$OSXCROSS_ROOT/bin/" | grep "apple-darwin.*-libtool$" | head -1)
-          if [ -n "$OSXCROSS_LIBTOOL" ]; then
-            printf '#!/bin/bash\nexec "%s/bin/%s" "$@"\n' "$OSXCROSS_ROOT" "$OSXCROSS_LIBTOOL" > /tmp/swift-wrapper/libtool
-            chmod +x /tmp/swift-wrapper/libtool
-            echo "✅ Created libtool wrapper -> $OSXCROSS_LIBTOOL"
-          else
-            # Fallback: use llvm-libtool-darwin if available, or create a stub
-            # that uses ar as a fallback
-            printf '#!/bin/bash\n# Stub libtool that delegates to ar for static libs\nif echo "$@" | grep -q "\\-static"; then\n  ar rcs "$@"\nelse\n  exec /usr/bin/libtool "$@" 2>/dev/null || ar rcs "$@"\nfi\n' > /tmp/swift-wrapper/libtool
-            chmod +x /tmp/swift-wrapper/libtool
-            echo "⚠️ No osxcross libtool found, using ar fallback"
-          fi
-
-          echo "Swift wrapper contents:"
-          cat /tmp/swift-wrapper/swift
-
-          # Put the wrapper first in PATH so screencapturekit's build.rs uses it
-          export PATH="/tmp/swift-wrapper:$PATH"
-
           cargo build --manifest-path server/Cargo.toml \
-            --package sc-agent --release --target ${{ matrix.target }}
+            --package sc-agent --release --target x86_64-apple-darwin
 
-      - name: Upload binary
+      - name: Build sc-agent (aarch64-apple-darwin)
+        run: |
+          cargo build --manifest-path server/Cargo.toml \
+            --package sc-agent --release --target aarch64-apple-darwin
+
+      - name: Upload x86_64 binary
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: server/target/${{ matrix.target }}/release/sc-agent
+          name: sc-agent-macos-x86_64
+          path: server/target/x86_64-apple-darwin/release/sc-agent
+          retention-days: 1
+
+      - name: Upload aarch64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sc-agent-macos-aarch64
+          path: server/target/aarch64-apple-darwin/release/sc-agent
           retention-days: 1
 
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
