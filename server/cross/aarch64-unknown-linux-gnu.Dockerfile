@@ -1,23 +1,33 @@
 # Custom cross-compilation image for aarch64-unknown-linux-gnu
-# Extends the default cross image (which includes Rust toolchain, etc.)
-# and adds Ubuntu 22.04 (jammy) arm64 repos because:
-#   - glib-sys v0.18 requires glib >= 2.70
-#   - The default cross image is Ubuntu 20.04 (focal) which has glib 2.64
-#   - Ubuntu 22.04 (jammy) has glib 2.72
-FROM ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main
+# Based on Ubuntu 22.04 (jammy) because glib-sys v0.18 requires glib >= 2.70,
+# which is not available in Ubuntu 20.04 (focal ships glib 2.64).
+#
+# cross-rs mounts the host Rust toolchain into the container, so we only
+# need the C cross-compiler and target-arch development libraries here.
+FROM ubuntu:22.04
 
-# Replace the focal arm64 package sources with jammy ones
-# The base system stays focal (x86_64) but the arm64 cross-libs come from jammy
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install the amd64 cross-compilation toolchain + basic build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    build-essential \
+    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+    libc6-dev-arm64-cross \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add arm64 architecture and install target-arch development libraries.
+# Since both host and target are on the same Ubuntu 22.04 base, there are
+# no version conflicts between amd64 and arm64 packages.
 RUN dpkg --add-architecture arm64 && \
-    # Remove existing focal sources for arm64 and add jammy ones
-    (rm -f /etc/apt/sources.list.d/cross-*.list 2>/dev/null || true) && \
-    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy main restricted universe" > /etc/apt/sources.list.d/jammy-arm64.list && \
-    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main restricted universe" >> /etc/apt/sources.list.d/jammy-arm64.list && \
-    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-security main restricted universe" >> /etc/apt/sources.list.d/jammy-arm64.list && \
-    # Import jammy signing keys
-    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 871920D1991BC93C 3B4FE6ACC0B21F32 || true && \
+    # Restrict existing sources to amd64 only
+    sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list && \
+    # Add arm64 sources from ports
+    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy main restricted universe" >> /etc/apt/sources.list && \
+    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main restricted universe" >> /etc/apt/sources.list && \
+    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-security main restricted universe" >> /etc/apt/sources.list && \
     apt-get update && \
-    # Install arm64 dev libraries from jammy (glib 2.72+)
     apt-get install -y --no-install-recommends \
     protobuf-compiler \
     libglib2.0-dev:arm64 \
@@ -30,5 +40,9 @@ RUN dpkg --add-architecture arm64 && \
     || true ) \
     && rm -rf /var/lib/apt/lists/*
 
+# Set up pkg-config for cross-compilation
 ENV PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
 ENV PKG_CONFIG_ALLOW_CROSS=1
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++

@@ -233,6 +233,14 @@ jobs:
           cat ~/.cargo/config.toml
 
       # ── Swift toolchain (needed by screencapturekit crate's build.rs) ──
+      - name: Install Swift runtime dependencies
+        run: |
+          # swift-build binary needs libxml2.so.2, libcurl, etc. at runtime
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxml2 libcurl4-openssl-dev libncurses5 libedit2 \
+            libsqlite3-0 libpython3-dev libz3-dev
+
       - name: Cache Swift toolchain
         id: swift-cache
         uses: actions/cache@v4
@@ -260,6 +268,7 @@ jobs:
           PKG_CONFIG_ALLOW_CROSS: 1
         run: |
           export PATH="/tmp/osxcross/bin:/tmp/swift-toolchain/usr/bin:$PATH"
+          export LD_LIBRARY_PATH="/tmp/swift-toolchain/usr/lib:${LD_LIBRARY_PATH:-}"
 
           # Point cc-rs at osxcross clang for the macOS *target* only.
           # Using target-specific CC_<target> vars so we don't leak osxcross
