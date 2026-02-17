@@ -239,13 +239,17 @@ jobs:
         run: |
           export PATH="/tmp/osxcross/bin:$PATH"
 
-          # Point cc-rs at osxcross clang (otherwise it picks system GCC
-          # and fails on -arch / -mmacosx-version-min flags)
+          # Point cc-rs at osxcross clang for the macOS *target* only.
+          # Using target-specific CC_<target> vars so we don't leak osxcross
+          # into build scripts that compile for the *host* (e.g. ring).
           ARCH=$(echo "${{ matrix.target }}" | cut -d- -f1)
           CLANG=$(ls "$OSXCROSS_ROOT/bin/" | grep "${ARCH}-apple-darwin.*-clang$" | head -1)
           AR_BIN=$(ls "$OSXCROSS_ROOT/bin/" | grep "${ARCH}-apple-darwin.*-ar$" | head -1)
-          export CC="${OSXCROSS_ROOT}/bin/${CLANG}"
-          export AR="${OSXCROSS_ROOT}/bin/${AR_BIN}"
+
+          # Convert target triple to env-var format: x86_64-apple-darwin -> x86_64_apple_darwin
+          TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
+          export "CC_${TARGET_ENV}=${OSXCROSS_ROOT}/bin/${CLANG}"
+          export "AR_${TARGET_ENV}=${OSXCROSS_ROOT}/bin/${AR_BIN}"
 
           cargo build --manifest-path server/Cargo.toml \
             --package sc-agent --release --target ${{ matrix.target }}

@@ -1841,7 +1841,7 @@ mod windows {
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
-    use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+    use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
     use windows_capture::frame::Frame;
     use windows_capture::graphics_capture_api::InternalCaptureControl;
     use windows_capture::monitor::Monitor;
@@ -2040,7 +2040,7 @@ mod windows {
 
             let width = frame.width();
             let height = frame.height();
-            let frame_buffer = frame.buffer()?;
+            let mut frame_buffer = frame.buffer()?;
             let bgra_data = frame_buffer.as_raw_buffer();
 
             // Lazy FFmpeg init on first frame (when we know dimensions)
@@ -2166,8 +2166,8 @@ mod windows {
             CursorCaptureSettings::WithCursor,
             DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::default(),
-            DirtyRegionSettings::default(),
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
             (ws_tx, session_id.clone(), ffmpeg_path, quality_config),
         );
