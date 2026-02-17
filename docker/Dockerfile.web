@@ -12,10 +12,6 @@ RUN npm ci
 # Copy source and build
 COPY web/ ./
 
-# Build arguments for Next.js
-ARG NEXT_PUBLIC_API_URL
-ARG NEXT_PUBLIC_WS_URL
-
 RUN npm run build
 
 # ─── Runtime ──────────────────────────────────────────────────

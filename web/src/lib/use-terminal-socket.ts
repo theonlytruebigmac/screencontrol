@@ -11,8 +11,7 @@ import {
     encodeTerminalResize,
     decodeEnvelope,
 } from '@/lib/proto';
-
-const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080/ws';
+import { getWsBase } from '@/lib/urls';
 
 export interface UseTerminalSocketOptions {
     sessionId: string;
@@ -34,7 +33,7 @@ export function useTerminalSocket({
     const connect = useCallback(() => {
         if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
-        const ws = new WebSocket(`${WS_BASE}/console/${sessionId}`);
+        const ws = new WebSocket(`${getWsBase()}/console/${sessionId}`);
         ws.binaryType = 'arraybuffer';
 
         ws.onopen = () => {

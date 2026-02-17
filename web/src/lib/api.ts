@@ -2,7 +2,7 @@
  * API client for communicating with the ScreenControl server.
  */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api";
+import { getApiBase } from '@/lib/urls';
 
 interface ApiOptions {
     method?: string;
@@ -526,5 +526,5 @@ export interface UpdatePolicy {
     auto_update_enabled: boolean;
 }
 
-// Singleton instance
-export const api = new ApiClient(API_BASE);
+// Singleton instance — lazily resolved so window.location is available
+export const api = new ApiClient(getApiBase());

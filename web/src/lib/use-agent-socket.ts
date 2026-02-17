@@ -16,8 +16,7 @@ import {
     encodeChatMessage,
     decodeEnvelope,
 } from '@/lib/proto';
-
-const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080/ws';
+import { getWsBase } from '@/lib/urls';
 
 export interface CommandResult {
     exitCode: number;
@@ -55,7 +54,7 @@ export function useAgentSocket({ agentId, onCommandResponse, onChatMessage }: Us
             const session = await api.createSession(agentId, 'terminal');
             sessionIdRef.current = session.id;
 
-            const ws = new WebSocket(`${WS_BASE}/console/${session.id}`);
+            const ws = new WebSocket(`${getWsBase()}/console/${session.id}`);
             ws.binaryType = 'arraybuffer';
 
             ws.onopen = () => {

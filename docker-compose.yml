@@ -93,9 +93,6 @@ services:
     #     NEXT_PUBLIC_WS_URL: ws://172.16.103.242:8080/ws
     ports:
       - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://172.16.103.242:8080/api
-      - NEXT_PUBLIC_WS_URL=ws://172.16.103.242:8080/ws
     depends_on:
       - sc-server
 

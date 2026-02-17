@@ -25,9 +25,9 @@ import {
     encodeQualitySettings,
     type MonitorInfo,
 } from '@/lib/proto';
+import { getWsBase } from '@/lib/urls';
 import { Monitor } from 'lucide-react';
 
-const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080/ws';
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 15000]; // exponential backoff
 
 export type ViewerStatus = 'connecting' | 'connected' | 'disconnected' | 'reconnecting';
@@ -203,7 +203,7 @@ const DesktopViewer = forwardRef<DesktopViewerHandle, DesktopViewerProps>(functi
     const connect = useCallback(() => {
         if (cancelledRef.current) return;
 
-        const ws = new WebSocket(`${WS_BASE}/console/${sessionId}`);
+        const ws = new WebSocket(`${getWsBase()}/console/${sessionId}`);
         ws.binaryType = 'arraybuffer';
         wsRef.current = ws;
 

@@ -8,8 +8,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-
-const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080/ws';
+import { getWsBase } from '@/lib/urls';
 
 export interface ServerEvent {
     type: string;
@@ -70,7 +69,7 @@ export function useEvents() {
     const connect = useCallback(() => {
         if (typeof window === 'undefined') return;
 
-        const ws = new WebSocket(`${WS_BASE}/events`);
+        const ws = new WebSocket(`${getWsBase()}/events`);
         wsRef.current = ws;
 
         ws.onopen = () => {

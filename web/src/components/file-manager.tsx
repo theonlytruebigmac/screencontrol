@@ -45,8 +45,7 @@ import {
     decodeEnvelope,
     type FileEntryInfo,
 } from '@/lib/proto';
-
-const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080/ws';
+import { getWsBase } from '@/lib/urls';
 
 interface FileEntry {
     name: string;
@@ -123,7 +122,7 @@ async function executeAgentCommand(
     timeoutSecs = 15,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
     const session = await api.createSession(agentId, 'terminal');
-    const wsUrl = `${WS_BASE}/console/${session.id}`;
+    const wsUrl = `${getWsBase()}/console/${session.id}`;
 
     return new Promise((resolve, reject) => {
         const ws = new WebSocket(wsUrl);
@@ -273,7 +272,7 @@ export default function FileManager({ sessionId, agentId, onNavigate, className 
     // ── WebSocket lifecycle ──
     useEffect(() => {
         setWsStatus('connecting');
-        const ws = new WebSocket(`${WS_BASE}/console/${sessionId}`);
+        const ws = new WebSocket(`${getWsBase()}/console/${sessionId}`);
         ws.binaryType = 'arraybuffer';
         wsRef.current = ws;
 

@@ -76,10 +76,9 @@ services:
       SC__AUTH__ACCESS_TOKEN_TTL_SECS: "3600"
       SC__AUTH__REFRESH_TOKEN_TTL_SECS: "604800"
       SC__S3__ENDPOINT: "http://sc-minio:9000"
-      SC__S3__PUBLIC_ENDPOINT: "https://${SC_SUBDOMAIN:-sc}.${SC_DOMAIN:-syschimp.com}/s3"
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-screencontrol}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?err}
-      AWS_REGION: "us-east-1"
+      SC__S3__ACCESS_KEY: ${MINIO_ROOT_USER:-screencontrol}
+      SC__S3__SECRET_KEY: ${MINIO_ROOT_PASSWORD:?err}
+      SC__S3__REGION: "us-east-1"
     networks:
       - t3_proxy
       - sc_internal
@@ -125,9 +124,6 @@ services:
   web:
     container_name: sc-web
     image: ghcr.io/theonlytruebigmac/screencontrol/web:latest
-    environment:
-      NEXT_PUBLIC_API_URL: "https://${SC_SUBDOMAIN:-sc}.${SC_DOMAIN:-syschimp.com}/api"
-      NEXT_PUBLIC_WS_URL: "wss://${SC_SUBDOMAIN:-sc}.${SC_DOMAIN:-syschimp.com}/ws"
     networks:
       - t3_proxy
       - sc_internal
