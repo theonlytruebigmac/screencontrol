@@ -200,10 +200,10 @@ export function SessionGroups({ agents, activeGroup, onGroupChange, onDeploy }: 
             <div className="px-4 pt-5 pb-3 border-b border-[#333]">
                 <div className="flex items-center gap-2 mb-1">
                     <Monitor className="w-5 h-5 text-[#e05246]" />
-                    <h2 className="text-base font-bold text-white">Access</h2>
+                    <h2 className="text-base font-bold text-white">Agents</h2>
                 </div>
                 <p className="text-[11px] text-gray-500 leading-snug">
-                    Use access sessions to provide indefinite access to familiar computers.
+                    Use agent sessions to provide indefinite access to familiar computers.
                 </p>
             </div>
 

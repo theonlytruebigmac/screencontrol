@@ -26,8 +26,8 @@ const SECTIONS: Section[] = [
         title: "Navigation",
         shortcuts: [
             { keys: ["G", "H"], label: "Go to Dashboard" },
-            { keys: ["G", "A"], label: "Go to Access (Agents)" },
-            { keys: ["G", "S"], label: "Go to Support Sessions" },
+            { keys: ["G", "A"], label: "Go to Agents" },
+            { keys: ["G", "S"], label: "Go to Ad-Hoc Sessions" },
             { keys: ["G", "T"], label: "Go to Terminal" },
             { keys: ["G", "F"], label: "Go to File Transfer" },
             { keys: ["G", "P"], label: "Go to Profile" },

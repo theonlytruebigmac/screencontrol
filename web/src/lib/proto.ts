@@ -21,29 +21,66 @@
  * Wire format reference: https://protobuf.dev/programming-guides/encoding/
  */
 
-// ─── Protobuf wire helpers ───────────────────────────────────
+// ─── UUID helper (works in non-secure HTTP contexts) ─────────
 
-/** Write a varint to a buffer. */
-function encodeVarint(value: number, buf: number[]): void {
-    let v = value >>> 0; // force unsigned 32-bit
-    while (v > 0x7f) {
-        buf.push((v & 0x7f) | 0x80);
-        v >>>= 7;
+/** Generate a v4 UUID, with fallback for insecure contexts where crypto.randomUUID is unavailable. */
+function uuid(): string {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
     }
-    buf.push(v & 0x7f);
+    // Fallback using crypto.getRandomValues (available in all modern browsers)
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 1
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-/** Read a varint from a DataView, returning [value, newOffset]. */
+// ─── Protobuf wire helpers ───────────────────────────────────
+
+/** Write a varint to a buffer. Handles values up to 2^53 (JS safe integer range). */
+function encodeVarint(value: number, buf: number[]): void {
+    // For values that fit in 32 bits, use fast bitwise path
+    if (value >= 0 && value <= 0xFFFFFFFF) {
+        let v = value >>> 0;
+        while (v > 0x7f) {
+            buf.push((v & 0x7f) | 0x80);
+            v >>>= 7;
+        }
+        buf.push(v & 0x7f);
+    } else {
+        // Large values (e.g. Date.now() timestamps) — use arithmetic
+        let v = Math.floor(value);
+        while (v > 0x7f) {
+            buf.push((v & 0x7f) | 0x80);
+            v = Math.floor(v / 128);
+        }
+        buf.push(v & 0x7f);
+    }
+}
+
+/** Read a varint from a DataView, returning [value, newOffset]. Handles up to 64-bit varints. */
 function decodeVarint(view: DataView, offset: number): [number, number] {
     let result = 0;
     let shift = 0;
     let byte: number;
     do {
         byte = view.getUint8(offset++);
-        result |= (byte & 0x7f) << shift;
+        if (shift < 28) {
+            // Safe to use bitwise for low bits
+            result |= (byte & 0x7f) << shift;
+        } else {
+            // Beyond 28 bits — use arithmetic to avoid 32-bit truncation
+            result += (byte & 0x7f) * Math.pow(2, shift);
+        }
         shift += 7;
     } while (byte & 0x80);
-    return [result >>> 0, offset];
+    // For values that fit in 32 bits, normalize with >>> 0
+    if (shift <= 35 && result <= 0xFFFFFFFF) {
+        return [result >>> 0, offset];
+    }
+    return [result, offset];
 }
 
 /** Encode a length-delimited field (wire type 2). */
@@ -144,7 +181,7 @@ export function encodeTerminalData(sessionId: string, data: Uint8Array): Uint8Ar
     encodeLengthDelimited(1, data, inner);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(30, new Uint8Array(inner), buf);
 
@@ -158,7 +195,7 @@ export function encodeTerminalResize(sessionId: string, cols: number, rows: numb
     encodeVarintField(2, rows, inner);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(31, new Uint8Array(inner), buf);
 
@@ -171,7 +208,7 @@ export function encodeSessionEnd(sessionId: string, reason: string): Uint8Array 
     encodeString(1, reason, inner);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(24, new Uint8Array(inner), buf);
 
@@ -198,7 +235,7 @@ export function encodeMouseMove(sessionId: string, x: number, y: number): Uint8A
 
     // Envelope
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(40, new Uint8Array(inputEvent), buf);
 
@@ -224,7 +261,7 @@ export function encodeMouseButton(
     encodeLengthDelimited(2, new Uint8Array(mouse), inputEvent);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(40, new Uint8Array(inputEvent), buf);
 
@@ -250,7 +287,7 @@ export function encodeMouseScroll(
     encodeLengthDelimited(3, new Uint8Array(mouse), inputEvent);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(40, new Uint8Array(inputEvent), buf);
 
@@ -280,7 +317,7 @@ export function encodeKeyEvent(
     encodeLengthDelimited(4, new Uint8Array(key), inputEvent);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(40, new Uint8Array(inputEvent), buf);
 
@@ -308,7 +345,7 @@ export function encodeCommandRequest(
     encodeVarintField(4, timeoutSecs, inner);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(70, new Uint8Array(inner), buf);
 
@@ -329,7 +366,7 @@ export function encodeChatMessage(
     encodeString(3, content, inner);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(60, new Uint8Array(inner), buf);
 
@@ -348,7 +385,7 @@ export function encodeFileListRequest(sessionId: string, path: string): Uint8Arr
     encodeString(1, path, inner);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(54, new Uint8Array(inner), buf);
 
@@ -371,10 +408,10 @@ export function encodeFileTransferRequest(
     encodeString(2, filePath, inner);
     encodeVarintField(3, fileSize, inner);
     encodeBoolField(4, upload, inner);
-    encodeString(5, transferId || crypto.randomUUID(), inner);
+    encodeString(5, transferId || uuid(), inner);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(50, new Uint8Array(inner), buf);
 
@@ -634,7 +671,7 @@ export function encodeClipboardData(sessionId: string, text: string): Uint8Array
 
     // Wrap in Envelope (field 42 = ClipboardData)
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(42, clipBytes, buf);
     return new Uint8Array(buf);
@@ -978,7 +1015,7 @@ export function encodeMonitorSwitch(sessionId: string, monitorIndex: number): Ui
     const innerBytes = new Uint8Array(inner);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(43, innerBytes, buf);
     return new Uint8Array(buf);
@@ -987,16 +1024,52 @@ export function encodeMonitorSwitch(sessionId: string, monitorIndex: number): Ui
 // ─── Quality Settings ───────────────────────────────────────
 
 /** Encode a QualitySettings envelope (field 44). */
-export function encodeQualitySettings(sessionId: string, quality: number, maxFps: number): Uint8Array {
+export function encodeQualitySettings(sessionId: string, quality: number, maxFps: number, bitrateKbps: number = 0): Uint8Array {
     const inner: number[] = [];
     if (quality > 0) encodeVarintField(1, quality, inner);
     if (maxFps > 0) encodeVarintField(2, maxFps, inner);
+    if (bitrateKbps > 0) encodeVarintField(3, bitrateKbps, inner);
     const innerBytes = new Uint8Array(inner);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(44, innerBytes, buf);
+    return new Uint8Array(buf);
+}
+
+// ─── Host Commands (session control) ────────────────────────
+
+/** Host command types matching proto HostCommandType enum values. */
+export type HostCommandType =
+    | 'block_input' | 'blank_screen' | 'wake_lock'
+    | 'reboot_normal' | 'reboot_safe';
+
+const HOST_COMMAND_VALUES: Record<HostCommandType, number> = {
+    block_input: 1,
+    blank_screen: 2,
+    wake_lock: 3,
+    reboot_normal: 4,
+    reboot_safe: 5,
+};
+
+/**
+ * Encode a HostCommand envelope (field 90).
+ *
+ * HostCommand { HostCommandType command = 1; bool enable = 2; }
+ */
+export function encodeHostCommand(
+    sessionId: string, command: HostCommandType, enable: boolean
+): Uint8Array {
+    const inner: number[] = [];
+    encodeVarintField(1, HOST_COMMAND_VALUES[command], inner);
+    encodeBoolField(2, enable, inner);
+    const innerBytes = new Uint8Array(inner);
+
+    const buf: number[] = [];
+    encodeString(1, uuid(), buf);
+    encodeString(2, sessionId, buf);
+    encodeLengthDelimited(90, innerBytes, buf);
     return new Uint8Array(buf);
 }
 
@@ -1009,7 +1082,7 @@ export function encodePing(sessionId: string, timestamp: number): Uint8Array {
     const innerBytes = new Uint8Array(inner);
 
     const buf: number[] = [];
-    encodeString(1, crypto.randomUUID(), buf);
+    encodeString(1, uuid(), buf);
     encodeString(2, sessionId, buf);
     encodeLengthDelimited(45, innerBytes, buf);
     return new Uint8Array(buf);

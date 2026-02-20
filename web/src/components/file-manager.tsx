@@ -426,7 +426,7 @@ export default function FileManager({ sessionId, agentId, onNavigate, className 
         if (files.length === 0) return;
 
         for (const file of files) {
-            const transferId = crypto.randomUUID();
+            const transferId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') ? crypto.randomUUID() : Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
             const remotePath = currentPath === '/' ? '/' + file.name : currentPath + '/' + file.name;
 
             // Store the file so we can upload it when the ack arrives

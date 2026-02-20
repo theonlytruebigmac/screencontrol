@@ -1,0 +1,59 @@
+[package]
+name = "sc-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ScreenControl native desktop viewer — H.264 decode + SDL2 rendering"
+
+[[bin]]
+name = "sc-viewer"
+path = "src/main.rs"
+
+[dependencies]
+# Internal
+sc-protocol = { path = "../sc-protocol" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+url = "2"
+
+# Protobuf
+prost = { workspace = true }
+
+# Video decoding (ffmpeg)
+ffmpeg-next = "7"
+
+# Rendering + Input
+sdl2 = { version = "0.37", features = ["ttf"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client (session creation, auth)
+reqwest = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Clipboard
+arboard = "3"
+
+# Audio decoding
+opus = "0.3"
+
+# Misc
+chrono = { workspace = true }
+image = "0.25"
+dirs = "6"

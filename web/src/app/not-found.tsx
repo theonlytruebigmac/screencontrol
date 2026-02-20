@@ -39,7 +39,7 @@ export default function NotFound() {
                         className="inline-flex items-center justify-center gap-2 bg-[#1e1e1e] border border-[#333] hover:bg-[#252525] text-gray-300 px-6 py-2.5 rounded-lg text-sm font-medium transition-colors"
                     >
                         <ArrowLeft className="w-4 h-4" />
-                        Remote Access
+                        Agents
                     </Link>
                 </div>
 

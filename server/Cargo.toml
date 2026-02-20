@@ -6,6 +6,7 @@ members = [
     "crates/sc-agent",
     "crates/sc-protocol",
     "crates/sc-common",
+    "crates/sc-viewer",
 ]
 
 [workspace.package]

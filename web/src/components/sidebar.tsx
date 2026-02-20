@@ -13,7 +13,6 @@ import {
     User,
     LogOut,
     UserCircle,
-    ChevronUp,
     LayoutDashboard,
     Search,
     Menu,
@@ -25,17 +24,16 @@ import {
     CalendarClock,
     Globe,
     Bell,
-    Sparkles,
 } from "lucide-react";
 import { ActionCenter } from "@/components/action-center";
-import { NotificationCenter } from "@/components/notification-center";
+import { api } from "@/lib/api";
 import Onboarding from "@/components/onboarding";
 
 const navItems = [
     { href: "/", label: "Home", icon: LayoutDashboard, exact: true },
-    { href: "/sessions", label: "Support", icon: Headset },
-    { href: "/desktop", label: "Meeting", icon: Video },
-    { href: "/agents", label: "Access", icon: KeyRound },
+    { href: "/sessions", label: "Ad-Hoc", icon: Headset },
+    { href: "/desktop", label: "Host", icon: Video },
+    { href: "/agents", label: "Agents", icon: KeyRound },
     { href: "/toolbox", label: "Toolbox", icon: Code2 },
     { href: "/reports", label: "Reports", icon: BarChart3 },
     { href: "/schedules", label: "Schedules", icon: CalendarClock },
@@ -46,50 +44,8 @@ const navItems = [
 const bottomItems = [
     { href: "/admin/settings", label: "Admin", icon: Settings },
 ];
-import { api } from "@/lib/api";
 
-// ─── Status Indicator ────────────────────────────────────
 
-function StatusDot() {
-    const [online, setOnline] = useState(0);
-    const [connected, setConnected] = useState(false);
-
-    const poll = useCallback(() => {
-        const token = localStorage.getItem("sc_access_token");
-        if (token) api.setToken(token);
-        api.getAgents()
-            .then((agents) => {
-                setOnline(agents.filter((a) => a.status === "online").length);
-                setConnected(true);
-            })
-            .catch(() => setConnected(false));
-    }, []);
-
-    useEffect(() => {
-        poll();
-        const id = setInterval(poll, 30_000);
-        return () => clearInterval(id);
-    }, [poll]);
-
-    return (
-        <div
-            className="flex items-center justify-center w-full py-1 group cursor-default"
-            title={connected ? `${online} agent${online !== 1 ? "s" : ""} online` : "Disconnected"}
-        >
-            <div className="relative">
-                <div
-                    className={`w-2 h-2 rounded-full ${connected ? "bg-emerald-500" : "bg-red-500"}`}
-                />
-                {connected && (
-                    <div className="absolute inset-0 rounded-full bg-emerald-500 animate-ping opacity-50" />
-                )}
-            </div>
-            <span className="ml-1.5 text-[9px] text-white/50 group-hover:text-white/80 transition-colors">
-                {connected ? online : "—"}
-            </span>
-        </div>
-    );
-}
 
 // ─── Mobile Hamburger Button (sticky, rendered outside sidebar) ───
 export function MobileMenuButton({ onClick }: { onClick: () => void }) {
@@ -112,7 +68,23 @@ export function Sidebar() {
     const [showUserMenu, setShowUserMenu] = useState(false);
     const [mobileOpen, setMobileOpen] = useState(false);
     const [showOnboarding, setShowOnboarding] = useState(false);
+    const [theme, setTheme] = useState<'dark' | 'light'>('dark');
     const menuRef = useRef<HTMLDivElement>(null);
+
+    // Initialize theme from localStorage
+    useEffect(() => {
+        const saved = localStorage.getItem('sc_theme') as 'dark' | 'light' | null;
+        const initial = saved || 'dark';
+        setTheme(initial);
+        document.documentElement.setAttribute('data-theme', initial);
+    }, []);
+
+    const toggleTheme = useCallback(() => {
+        const next = theme === 'dark' ? 'light' : 'dark';
+        setTheme(next);
+        document.documentElement.setAttribute('data-theme', next);
+        localStorage.setItem('sc_theme', next);
+    }, [theme]);
 
     // Show onboarding for first-time users
     useEffect(() => {
@@ -209,35 +181,7 @@ export function Sidebar() {
                 })}
             </nav>
 
-            {/* Theme toggle */}
-            <button
-                onClick={() => {
-                    const html = document.documentElement;
-                    const isLight = html.getAttribute('data-theme') === 'light';
-                    html.setAttribute('data-theme', isLight ? 'dark' : 'light');
-                    localStorage.setItem('sc_theme', isLight ? 'dark' : 'light');
-                }}
-                className="flex items-center justify-center py-2 text-white/60 hover:text-white hover:bg-white/10 transition-colors"
-                title="Toggle theme"
-            >
-                {typeof window !== 'undefined' && document.documentElement.getAttribute('data-theme') === 'light' ? (
-                    <Moon className="w-4 h-4" />
-                ) : (
-                    <Sun className="w-4 h-4" />
-                )}
-            </button>
-
-            {/* Status indicator */}
-            <div className="flex flex-col items-center py-2 border-t border-white/15">
-                <StatusDot />
-            </div>
-
-            {/* Notification Center */}
-            <div className="flex flex-col items-center border-t border-white/15">
-                <NotificationCenter />
-            </div>
-
-            {/* Action Center */}
+            {/* System Health */}
             <div className="flex flex-col items-center border-t border-white/15 py-1">
                 <ActionCenter />
             </div>
@@ -287,6 +231,17 @@ export function Sidebar() {
                                     <UserCircle className="w-4 h-4 text-gray-500" />
                                     Profile
                                 </Link>
+                                <button
+                                    onClick={toggleTheme}
+                                    className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-gray-300 hover:bg-white/5 transition-colors cursor-pointer"
+                                >
+                                    {theme === 'dark' ? (
+                                        <Sun className="w-4 h-4 text-gray-500" />
+                                    ) : (
+                                        <Moon className="w-4 h-4 text-gray-500" />
+                                    )}
+                                    {theme === 'dark' ? 'Light Mode' : 'Dark Mode'}
+                                </button>
                                 <button
                                     onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); handleLogout(); }}
                                     className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"

@@ -1,0 +1,502 @@
+@import "tailwindcss";
+
+:root {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color-scheme: dark;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: #0a0a0a;
+  color: #e5e5e5;
+}
+
+/* ─── Animations ─── */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.4;
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.spinning {
+  animation: spin 0.7s linear infinite;
+}
+
+/* ═══════════════════════════════════════════════════════ */
+/* ─── Waiting Screen ─── */
+/* ═══════════════════════════════════════════════════════ */
+
+.waiting-screen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 12px;
+  background: #0a0a0a;
+}
+
+.waiting-spinner {
+  width: 28px;
+  height: 28px;
+  color: #666;
+  animation: spin 0.7s linear infinite;
+}
+
+.waiting-text {
+  font-size: 14px;
+  color: #888;
+  font-weight: 500;
+}
+
+.waiting-subtext {
+  font-size: 11px;
+  color: #555;
+}
+
+/* ═══════════════════════════════════════════════════════ */
+/* ─── Viewer Layout ─── */
+/* ═══════════════════════════════════════════════════════ */
+
+.viewer-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: #000;
+}
+
+.viewer-canvas-area {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.viewer-canvas-inner {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.viewer-canvas-center {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+}
+
+/* ═══════════════════════════════════════════════════════ */
+/* ─── ScreenConnect Toolbar Bar ─── */
+/* ═══════════════════════════════════════════════════════ */
+
+.sc-toolbar {
+  display: flex;
+  align-items: center;
+  height: 36px;
+  background: #1a1a1a;
+  border-bottom: 1px solid #2a2a2a;
+  padding: 0 8px;
+  flex-shrink: 0;
+  z-index: 100;
+  user-select: none;
+}
+
+/* ─── Left: session info ─── */
+.sc-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-shrink: 0;
+  padding-right: 16px;
+}
+
+.sc-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.sc-dot-connected {
+  background: #4ade80;
+  box-shadow: 0 0 6px rgba(74, 222, 128, 0.4);
+}
+
+.sc-dot-disconnected {
+  background: #f87171;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.sc-dot-connecting {
+  background: #fbbf24;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.sc-session-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e5e5e5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.sc-session-meta {
+  font-size: 11px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: #555;
+  white-space: nowrap;
+}
+
+.sc-meta-highlight {
+  color: rgba(168, 85, 247, 0.6);
+}
+
+.sc-meta-latency {
+  color: rgba(34, 211, 238, 0.6);
+}
+
+/* ─── Center: icon-only buttons ─── */
+.sc-toolbar-center {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+}
+
+.sc-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  background: none;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  transition: all 0.12s;
+  position: relative;
+}
+
+.sc-icon-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+.sc-icon-btn:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.sc-icon-btn-active {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* Active indicator bar under button */
+.sc-icon-btn-active::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 6px;
+  right: 6px;
+  height: 2px;
+  background: #e05246;
+  border-radius: 1px;
+}
+
+.sc-icon-btn-status {
+  cursor: default;
+}
+
+.sc-icon-btn-status:hover {
+  background: none;
+}
+
+/* Divider between icon groups */
+.sc-toolbar-center .sc-divider {
+  width: 1px;
+  height: 18px;
+  background: #333;
+  margin: 0 4px;
+}
+
+/* ─── Right: disconnect ─── */
+.sc-toolbar-right {
+  display: flex;
+  align-items: center;
+  padding-left: 16px;
+}
+
+.sc-disconnect-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  background: none;
+  border: none;
+  color: #e05246;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+
+.sc-disconnect-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+.sc-disconnect-btn:hover {
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+/* ═══════════════════════════════════════════════════════ */
+/* ─── Drop-down Panel (grid of tiles) ─── */
+/* ═══════════════════════════════════════════════════════ */
+
+.sc-panel {
+  background: #1a1a1a;
+  border-bottom: 1px solid #2a2a2a;
+  flex-shrink: 0;
+  z-index: 99;
+  animation: fadeIn 0.15s ease;
+}
+
+.sc-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px 6px;
+}
+
+.sc-panel-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #e5e5e5;
+}
+
+.sc-panel-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: none;
+  border: none;
+  color: #666;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.12s;
+}
+
+.sc-panel-close svg {
+  width: 16px;
+  height: 16px;
+}
+
+.sc-panel-close:hover {
+  color: #e5e5e5;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* ─── Tile Grid ─── */
+.sc-panel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 1px;
+  padding: 8px 16px 16px;
+}
+
+.sc-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 16px 8px;
+  background: #222;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  color: #ccc;
+  cursor: pointer;
+  transition: all 0.12s;
+  text-align: center;
+  min-height: 90px;
+}
+
+.sc-tile:hover {
+  background: #2a2a2a;
+  border-color: #3a3a3a;
+  color: #fff;
+}
+
+.sc-tile-selected {
+  background: rgba(224, 82, 70, 0.08);
+  border-color: rgba(224, 82, 70, 0.3);
+  color: #e05246;
+}
+
+.sc-tile-selected:hover {
+  background: rgba(224, 82, 70, 0.12);
+}
+
+.sc-tile-icon {
+  font-size: 24px;
+  line-height: 1;
+}
+
+.sc-tile-lucide-icon {
+  width: 24px;
+  height: 24px;
+  color: inherit;
+  opacity: 0.7;
+}
+
+.sc-tile-label {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.sc-tile-desc {
+  font-size: 9px;
+  color: #666;
+  line-height: 1.2;
+}
+
+/* ═══════════════════════════════════════════════════════ */
+/* ─── Desktop Viewer ─── */
+/* ═══════════════════════════════════════════════════════ */
+
+.desktop-viewer-wrapper {
+  display: flex;
+  flex-direction: column;
+  background: #000;
+  overflow: hidden;
+  height: 100%;
+}
+
+.desktop-viewer-canvas-container {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
+}
+
+.dv-connecting-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 13px;
+  z-index: 2;
+}
+
+.dv-focus-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  cursor: pointer;
+}
+
+.dv-focus-hint {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 12px;
+  pointer-events: none;
+  animation: fadeIn 0.3s ease;
+}
+
+.dv-spinner {
+  width: 28px;
+  height: 28px;
+  border: 2px solid rgba(255, 255, 255, 0.1);
+  border-top-color: #e05246;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+.desktop-viewer-canvas {
+  max-width: 100%;
+  max-height: 100%;
+  outline: none;
+  image-rendering: auto;
+  cursor: default;
+}
+
+.desktop-viewer-canvas.focused {
+  cursor: none;
+}
+
+.h264-error-banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: 16px;
+  z-index: 100;
+  background: rgba(180, 30, 30, 0.95);
+  color: #fff;
+  font-family: monospace;
+  font-size: 13px;
+  border-bottom: 2px solid #ff4444;
+}

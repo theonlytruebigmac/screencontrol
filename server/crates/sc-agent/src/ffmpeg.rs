@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! FFmpeg auto-provisioning module.
 //!
 //! Provides [`ensure_ffmpeg()`] which returns the path to a usable `ffmpeg`

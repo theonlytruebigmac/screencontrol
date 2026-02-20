@@ -67,6 +67,7 @@ fn check_full_disk_access() -> bool {
 // `CGPreflightScreenCaptureAccess()`, which only check the setup app's
 // own permissions and would incorrectly report "granted".
 
+#[allow(dead_code)]
 const DAEMON_BUNDLE_ID: &str = "com.screencontrol.agent";
 
 /// Query the system TCC database for a given service and bundle ID.

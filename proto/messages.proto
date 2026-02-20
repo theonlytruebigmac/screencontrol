@@ -58,6 +58,12 @@ message Envelope {
 
         // Desktop streaming
         DesktopFrame        desktop_frame         = 80;
+        CursorData          cursor_data           = 81;
+        CursorPosition      cursor_position       = 82;
+        AudioFrame          audio_frame           = 83;
+
+        // Host commands (session control)
+        HostCommand         host_command          = 90;
 
         // Error
         ErrorMessage        error_message         = 99;
@@ -209,6 +215,7 @@ message InputEvent {
         MouseButton  mouse_button = 2;
         MouseScroll  mouse_scroll = 3;
         KeyEvent     key_event = 4;
+        RelativeMouseMove relative_mouse_move = 5;
     }
 }
 
@@ -229,6 +236,11 @@ message MouseScroll {
     double delta_y = 2;
     double x = 3;
     double y = 4;
+}
+
+message RelativeMouseMove {
+    int32 dx = 1;              // pixel delta X
+    int32 dy = 2;              // pixel delta Y
 }
 
 message KeyEvent {
@@ -262,6 +274,38 @@ message DesktopFrame {
     bool   is_keyframe = 7;    // true for JPEG frames and H264 IDR frames
 }
 
+// ─── Cursor Data ─────────────────────────────────────────────
+
+// Cursor shape — sent when cursor appearance changes.
+// Viewer caches shapes by cursor_id; agent only sends full pixel data
+// on first appearance (or when shape changes).
+message CursorData {
+    uint64 cursor_id = 1;      // platform cursor handle (stable across frames)
+    uint32 width = 2;          // cursor image width in pixels
+    uint32 height = 3;         // cursor image height in pixels
+    uint32 hotspot_x = 4;      // click-point X offset from top-left
+    uint32 hotspot_y = 5;      // click-point Y offset from top-left
+    bytes  data = 6;           // RGBA pixel data (width * height * 4 bytes)
+}
+
+// Cursor position — sent alongside each DesktopFrame.
+// References a previously-sent CursorData.
+message CursorPosition {
+    double x = 1;              // normalized 0.0-1.0 relative to captured monitor
+    double y = 2;
+    uint64 cursor_id = 3;      // references CursorData shape
+    bool   visible = 4;        // false when cursor is hidden or off-screen
+}
+
+// ─── Audio ───────────────────────────────────────────────────
+
+message AudioFrame {
+    bytes  data = 1;           // Opus-encoded audio data
+    uint32 sample_rate = 2;    // sample rate in Hz (e.g. 48000)
+    uint32 channels = 3;       // number of channels (1=mono, 2=stereo)
+    uint32 sequence = 4;       // monotonic frame counter
+}
+
 // ─── Clipboard ───────────────────────────────────────────────
 
 message ClipboardData {
@@ -280,6 +324,7 @@ message MonitorSwitch {
 message QualitySettings {
     uint32 quality = 1;        // JPEG quality 1-100, or 0 for auto
     uint32 max_fps = 2;        // Target max FPS (0 = default 30)
+    uint32 bitrate_kbps = 3;   // H264 bitrate in kbps (0 = default 4000)
 }
 
 // ─── Latency Measurement ─────────────────────────────────────
@@ -356,6 +401,22 @@ message CommandResponse {
     string stdout = 2;
     string stderr = 3;
     bool   timed_out = 4;
+}
+
+// ─── Host Commands (session control) ────────────────────────
+
+enum HostCommandType {
+    HOST_COMMAND_UNSPECIFIED = 0;
+    HOST_COMMAND_BLOCK_INPUT = 1;     // Block guest mouse/keyboard
+    HOST_COMMAND_BLANK_SCREEN = 2;    // Blank guest monitor(s)
+    HOST_COMMAND_WAKE_LOCK = 3;       // Prevent sleep/screen lock
+    HOST_COMMAND_REBOOT_NORMAL = 4;   // Reboot to normal mode
+    HOST_COMMAND_REBOOT_SAFE = 5;     // Reboot to safe mode + networking
+}
+
+message HostCommand {
+    HostCommandType command = 1;
+    bool enable = 2;                  // toggle on/off for stateful commands
 }
 
 // ─── Error ───────────────────────────────────────────────────

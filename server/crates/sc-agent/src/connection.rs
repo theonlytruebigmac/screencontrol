@@ -16,11 +16,13 @@ use sc_protocol::{
     SessionEnd, SessionOffer, DEFAULT_HEARTBEAT_INTERVAL_SECS,
 };
 
+use crate::audio::AudioCapturer;
 use crate::chat::ChatHandle;
 use crate::command;
 use crate::consent;
 use crate::filebrowser::FileBrowser;
 use crate::input::InputInjector;
+use crate::input::KeyTracker;
 use crate::screen::DesktopCapturer;
 use crate::sysinfo_collector::{self, SystemInfo};
 use crate::terminal::TerminalManager;
@@ -47,7 +49,10 @@ pub async fn connect_and_run(
     // Session managers
     let mut terminal_mgr = TerminalManager::new();
     let mut desktop_capturer = DesktopCapturer::new();
+    let mut audio_capturer = AudioCapturer::new();
     let mut input_injector: Option<InputInjector> = None;
+    let mut key_tracker = KeyTracker::new();
+    let stuck_key_threshold = std::time::Duration::from_secs(30);
     let mut clipboard_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
 
     // Derive HTTP base URL from WS URL (e.g. ws://host:8080/ws/agent → http://host:8080)
@@ -466,6 +471,9 @@ pub async fn connect_and_run(
                                         tx.clone(),
                                     );
 
+                                    // Start audio capture alongside video
+                                    audio_capturer.start_capture(&session_id, tx.clone());
+
                                     // Create input injector — prefer Mutter D-Bus on Linux/Wayland
                                     #[cfg(target_os = "linux")]
                                     {
@@ -670,15 +678,28 @@ pub async fn connect_and_run(
                                 tracing::info!("Session ended: {}", end.reason);
                                 terminal_mgr.close_session(&session_id);
                                 desktop_capturer.stop_capture(&session_id);
+                                audio_capturer.stop_capture(&session_id);
                                 // Release stuck modifier keys before dropping the injector
                                 if let Some(ref mut inj) = input_injector {
+                                    // Release any stuck keys detected by the tracker
+                                    let stuck = key_tracker.stuck_keys(stuck_key_threshold);
+                                    if !stuck.is_empty() {
+                                        tracing::warn!(
+                                            stuck_count = stuck.len(),
+                                            "Releasing {} stuck keys on session end",
+                                            stuck.len()
+                                        );
+                                    }
                                     inj.release_all_keys();
                                 }
+                                key_tracker.clear();
                                 input_injector = None;
                                 // Stop clipboard polling
                                 if let Some(cancel) = clipboard_cancel.take() {
                                     let _ = cancel.send(());
                                 }
+                                // Clean up any active host commands (block input, blank screen, wake lock)
+                                crate::host_commands::cleanup();
                                 tracing::info!(
                                     "Input injector cleared for session: {}",
                                     session_id
@@ -687,6 +708,16 @@ pub async fn connect_and_run(
                             Some(envelope::Payload::InputEvent(evt)) => {
                                 if let Some(ref mut injector) = input_injector {
                                     tracing::debug!("InputEvent received, injecting");
+                                    // Track key/button state for stuck key detection
+                                    match &evt.event {
+                                        Some(sc_protocol::input_event::Event::KeyEvent(key)) => {
+                                            key_tracker.track_key(key.key_code, key.pressed);
+                                        }
+                                        Some(sc_protocol::input_event::Event::MouseButton(btn)) => {
+                                            key_tracker.track_button(btn.button, btn.pressed);
+                                        }
+                                        _ => {}
+                                    }
                                     injector.handle_event(&evt);
                                 } else {
                                     tracing::warn!(
@@ -770,11 +801,45 @@ pub async fn connect_and_run(
                             }
                             Some(envelope::Payload::QualitySettings(qs)) => {
                                 tracing::info!(
-                                    "QualitySettings received: quality={}, max_fps={}",
+                                    "QualitySettings received: quality={}, max_fps={}, bitrate_kbps={}",
                                     qs.quality,
-                                    qs.max_fps
+                                    qs.max_fps,
+                                    qs.bitrate_kbps
                                 );
-                                desktop_capturer.set_quality(&session_id, qs.quality, qs.max_fps);
+                                desktop_capturer.set_quality(
+                                    &session_id,
+                                    qs.quality,
+                                    qs.max_fps,
+                                    qs.bitrate_kbps,
+                                );
+                            }
+                            Some(envelope::Payload::HostCommand(cmd)) => {
+                                let cmd_type = sc_protocol::HostCommandType::try_from(cmd.command);
+                                tracing::info!(
+                                    "HostCommand received: {:?} enable={}",
+                                    cmd_type,
+                                    cmd.enable
+                                );
+                                match cmd_type {
+                                    Ok(sc_protocol::HostCommandType::HostCommandBlockInput) => {
+                                        crate::host_commands::set_block_input(cmd.enable);
+                                    }
+                                    Ok(sc_protocol::HostCommandType::HostCommandBlankScreen) => {
+                                        crate::host_commands::set_blank_screen(cmd.enable);
+                                    }
+                                    Ok(sc_protocol::HostCommandType::HostCommandWakeLock) => {
+                                        crate::host_commands::set_wake_lock(cmd.enable);
+                                    }
+                                    Ok(sc_protocol::HostCommandType::HostCommandRebootNormal) => {
+                                        crate::host_commands::reboot_normal();
+                                    }
+                                    Ok(sc_protocol::HostCommandType::HostCommandRebootSafe) => {
+                                        crate::host_commands::reboot_safe_mode();
+                                    }
+                                    _ => {
+                                        tracing::warn!("Unknown HostCommand type: {}", cmd.command);
+                                    }
+                                }
                             }
                             Some(envelope::Payload::CommandRequest(cmd)) => {
                                 tracing::info!("Command requested: {} {:?}", cmd.command, cmd.args);
@@ -849,6 +914,7 @@ pub async fn connect_and_run(
     // Cleanup
     terminal_mgr.close_all();
     desktop_capturer.stop_all();
+    audio_capturer.stop_all();
     heartbeat_handle.abort();
     writer_handle.abort();
     Ok(())
@@ -922,179 +988,160 @@ fn read_cpu_model() -> String {
     }
 }
 
-/// Capture a desktop screenshot and upload it to the pre-signed S3 URL.
+/// Capture a desktop screenshot and upload it to the server.
 ///
-/// Uses the Mutter ScreenCast D-Bus API (same as remote desktop streaming)
-/// to get a PipeWire node, then captures a single JPEG frame via GStreamer.
-/// This is the only reliable method on GNOME 46+ Wayland where external
-/// screenshot CLI tools are blocked or deprecated.
+/// The agent runs as root but the Mutter ScreenCast D-Bus API is only
+/// accessible from processes in the desktop user's session.  We solve this
+/// by spawning a small Python helper (`sc_capture_thumbnail.py`) under the
+/// desktop user's UID/GID via `pre_exec` setuid/setgid.  The helper handles
+/// D-Bus + GStreamer, writes a JPEG to disk, and we upload it.
 #[cfg(target_os = "linux")]
 async fn capture_and_upload_thumbnail(upload_url: &str) -> anyhow::Result<()> {
-    use zbus::Connection;
-
     let tmp_path = "/tmp/sc_thumbnail.jpg";
 
     // Clean up any previous screenshot
     let _ = tokio::fs::remove_file(tmp_path).await;
 
-    // Connect to the session D-Bus
-    let connection = Connection::session().await?;
+    // Determine the desktop user's UID and GID (set by adopt_graphical_session_env)
+    let session_uid: u32 = std::env::var("SC_SESSION_UID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let session_gid: u32 = std::env::var("SC_SESSION_GID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
-    // Create a Mutter ScreenCast session
-    // is-recording=false tells GNOME this is a one-shot capture, suppressing
-    // the "screen recording" indicator in the system tray.
-    let mut session_props = std::collections::HashMap::<String, zbus::zvariant::Value>::new();
-    session_props.insert(
-        "disable-animations".to_string(),
-        zbus::zvariant::Value::Bool(true),
-    );
-    session_props.insert(
-        "is-recording".to_string(),
-        zbus::zvariant::Value::Bool(false),
-    );
-
-    let session_path: zbus::zvariant::OwnedObjectPath = connection
-        .call_method(
-            Some("org.gnome.Mutter.ScreenCast"),
-            "/org/gnome/Mutter/ScreenCast",
-            Some("org.gnome.Mutter.ScreenCast"),
-            "CreateSession",
-            &(session_props,),
-        )
-        .await?
-        .body()
-        .deserialize()?;
-
-    // Create a stream for the primary monitor (no cursor)
-    let mut stream_props = std::collections::HashMap::<String, zbus::zvariant::Value>::new();
-    stream_props.insert(
-        "cursor-mode".to_string(),
-        zbus::zvariant::Value::U32(0), // 0 = hidden for thumbnail
-    );
-
-    let _stream_path: zbus::zvariant::OwnedObjectPath = connection
-        .call_method(
-            Some("org.gnome.Mutter.ScreenCast"),
-            session_path.as_ref(),
-            Some("org.gnome.Mutter.ScreenCast.Session"),
-            "RecordMonitor",
-            &("", stream_props),
-        )
-        .await?
-        .body()
-        .deserialize()?;
-
-    // Listen for the PipeWireStreamAdded signal to get node_id
-    let (node_tx, node_rx) = tokio::sync::oneshot::channel::<u32>();
-
-    let signal_conn = connection.clone();
-    let signal_task = tokio::spawn(async move {
-        use futures_util::StreamExt;
-
-        let mut stream = zbus::MessageStream::from(&signal_conn);
-        while let Some(msg) = stream.next().await {
-            if let Ok(msg) = msg {
-                let header = msg.header();
-                if header.member().map(|m| m.as_str()) == Some("PipeWireStreamAdded") {
-                    if let Ok(node_id) = msg.body().deserialize::<u32>() {
-                        let _ = node_tx.send(node_id);
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    // Start the session
-    connection
-        .call_method(
-            Some("org.gnome.Mutter.ScreenCast"),
-            session_path.as_ref(),
-            Some("org.gnome.Mutter.ScreenCast.Session"),
-            "Start",
-            &(),
-        )
-        .await?;
-
-    // Wait for the PipeWire node_id
-    let node_id = tokio::time::timeout(std::time::Duration::from_secs(5), node_rx)
-        .await
-        .map_err(|_| anyhow::anyhow!("Timeout waiting for PipeWire node"))?
-        .map_err(|_| anyhow::anyhow!("Signal task dropped"))?;
-
-    signal_task.abort();
-
-    tracing::debug!(node_id, "Thumbnail capture: PipeWire node ready");
-
-    // Use GStreamer to capture a single JPEG frame from the PipeWire node
-    let pw_src =
-        format!("pipewiresrc path={node_id} do-timestamp=true keepalive-time=1000 num-buffers=1");
-    let gst_args =
-        format!("{pw_src} ! videoconvert ! jpegenc quality=75 ! filesink location={tmp_path}");
-
-    let gst_result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new("gst-launch-1.0")
-            .arg("-e")
-            .args(gst_args.split_whitespace())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output(),
-    )
-    .await;
-
-    // Stop the Mutter ScreenCast session
-    let _ = connection
-        .call_method(
-            Some("org.gnome.Mutter.ScreenCast"),
-            session_path.as_ref(),
-            Some("org.gnome.Mutter.ScreenCast.Session"),
-            "Stop",
-            &(),
-        )
-        .await;
-
-    // Check if GStreamer succeeded
-    match gst_result {
-        Ok(Ok(output)) if output.status.success() => {}
-        Ok(Ok(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "gst-launch failed: exit={}, stderr={}",
-                output.status,
-                stderr
-            );
-        }
-        Ok(Err(e)) => anyhow::bail!("gst-launch spawn error: {}", e),
-        Err(_) => anyhow::bail!("gst-launch timed out"),
+    if session_uid == 0 {
+        anyhow::bail!("Thumbnail: no desktop session user found (SC_SESSION_UID not set)");
     }
 
-    // Read the captured frame
+    // Locate the helper script — look beside the agent binary first, then /opt/screencontrol
+    let helper_path = {
+        let beside_binary = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("sc_capture_thumbnail.py")));
+        if let Some(ref p) = beside_binary {
+            if p.exists() {
+                p.clone()
+            } else {
+                std::path::PathBuf::from("/opt/screencontrol/sc_capture_thumbnail.py")
+            }
+        } else {
+            std::path::PathBuf::from("/opt/screencontrol/sc_capture_thumbnail.py")
+        }
+    };
+
+    if !helper_path.exists() {
+        anyhow::bail!(
+            "Thumbnail: helper script not found at {}",
+            helper_path.display()
+        );
+    }
+
+    tracing::debug!(
+        uid = session_uid,
+        gid = session_gid,
+        helper = %helper_path.display(),
+        "Thumbnail: spawning capture helper as desktop user"
+    );
+
+    // Collect the environment the helper needs
+    let dbus_addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default();
+    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+
+    // Spawn the helper as the desktop user
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::process::Command::new("python3")
+            .arg(&helper_path)
+            .arg(tmp_path)
+            .arg("75")
+            .env_clear()
+            .env("DBUS_SESSION_BUS_ADDRESS", &dbus_addr)
+            .env("XDG_RUNTIME_DIR", &xdg_runtime)
+            .env("WAYLAND_DISPLAY", &wayland_display)
+            .env("DISPLAY", &display)
+            .env(
+                "HOME",
+                format!("/home/{}", get_username_for_uid(session_uid)),
+            )
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .uid(session_uid)
+            .gid(session_gid)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Thumbnail: capture helper timed out (20s)"))?
+    .map_err(|e| anyhow::anyhow!("Thumbnail: failed to spawn helper: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !stderr.is_empty() {
+        tracing::debug!("Thumbnail helper stderr: {}", stderr.trim());
+    }
+
+    let stdout_trimmed = stdout.trim();
+    if stdout_trimmed.starts_with("OK:") {
+        tracing::info!("Thumbnail: capture succeeded — {}", stdout_trimmed);
+    } else {
+        anyhow::bail!(
+            "Thumbnail: capture failed — stdout={}, exit={}",
+            stdout_trimmed,
+            output.status
+        );
+    }
+
+    // Read the captured frame and upload
     let data = tokio::fs::read(tmp_path).await?;
     let _ = tokio::fs::remove_file(tmp_path).await;
 
     if data.is_empty() {
-        anyhow::bail!("Screenshot file was empty");
+        anyhow::bail!("Thumbnail: screenshot file was empty");
     }
 
-    tracing::debug!("Captured thumbnail: {} bytes", data.len());
+    tracing::info!("Thumbnail: captured {} bytes, uploading", data.len());
 
-    // Upload via pre-signed PUT URL
     let client = reqwest::Client::new();
     let resp = client
         .put(upload_url)
         .header("Content-Type", "image/jpeg")
         .body(data)
         .send()
-        .await?;
+        .await
+        .map_err(|e| anyhow::anyhow!("Thumbnail: HTTP upload failed: {}", e))?;
 
     if resp.status().is_success() {
-        tracing::debug!("Thumbnail uploaded successfully");
+        tracing::info!("Thumbnail: uploaded successfully");
     } else {
-        tracing::debug!("Thumbnail upload failed: HTTP {}", resp.status());
+        tracing::warn!("Thumbnail: upload returned HTTP {}", resp.status());
     }
 
     Ok(())
+}
+
+/// Look up the username for a given UID by reading /etc/passwd.
+#[cfg(target_os = "linux")]
+fn get_username_for_uid(uid: u32) -> String {
+    if let Ok(contents) = std::fs::read_to_string("/etc/passwd") {
+        for line in contents.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() >= 3 {
+                if let Ok(line_uid) = fields[2].parse::<u32>() {
+                    if line_uid == uid {
+                        return fields[0].to_string();
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: use the UID as the username
+    uid.to_string()
 }
 
 /// Capture a desktop screenshot on macOS and upload it to the pre-signed S3 URL.

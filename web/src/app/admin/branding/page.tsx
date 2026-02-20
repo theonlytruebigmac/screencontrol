@@ -55,7 +55,7 @@ export default function BrandingPage() {
 
     // Branding state
     const [companyName, setCompanyName] = useState('ScreenControl');
-    const [tagline, setTagline] = useState('Remote access & support');
+    const [tagline, setTagline] = useState('Remote access & ad-hoc sessions');
     const [primaryColor, setPrimaryColor] = useState('#e05246');
     const [accentColor, setAccentColor] = useState('#f06b60');
     const [bgColor, setBgColor] = useState('#141414');
@@ -113,7 +113,7 @@ export default function BrandingPage() {
 
     const handleReset = useCallback(() => {
         setCompanyName('ScreenControl');
-        setTagline('Remote access & support');
+        setTagline('Remote access & ad-hoc sessions');
         setPrimaryColor('#e05246');
         setAccentColor('#f06b60');
         setBgColor('#141414');

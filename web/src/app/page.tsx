@@ -435,7 +435,7 @@ export default function DashboardPage() {
                 <h3 className="text-sm font-semibold text-white">Quick Actions</h3>
               </div>
               <div className="p-2 space-y-0.5">
-                <QuickAction icon={Monitor} label="Remote Access" href="/agents" color="#e05246" kbd="G A" />
+                <QuickAction icon={Monitor} label="Agents" href="/agents" color="#e05246" kbd="G A" />
                 <QuickAction icon={Terminal} label="Open Terminal" href="/agents" color="#10b981" kbd="G T" />
                 <QuickAction icon={HardDrive} label="File Transfer" href="/files" color="#22d3ee" kbd="G F" />
                 <QuickAction icon={Users} label="Manage Users" href="/admin/users" color="#a78bfa" kbd="G 2" />

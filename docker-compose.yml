@@ -49,11 +49,11 @@ services:
 
   # ─── ScreenControl Server ───────────────────────────────────
   sc-server:
-    image: ghcr.io/theonlytruebigmac/screencontrol/server:latest
+    # image: ghcr.io/theonlytruebigmac/screencontrol/server:latest
     # To build locally instead of pulling from GHCR, uncomment:
-    # build:
-    #   context: .
-    #   dockerfile: docker/Dockerfile.server
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
     ports:
       - "8080:8080"
     env_file: .env
@@ -71,11 +71,11 @@ services:
 
   # ─── ScreenControl Relay ─────────────────────────────────────
   sc-relay:
-    image: ghcr.io/theonlytruebigmac/screencontrol/relay:latest
+    # image: ghcr.io/theonlytruebigmac/screencontrol/relay:latest
     # To build locally instead of pulling from GHCR, uncomment:
-    # build:
-    #   context: .
-    #   dockerfile: docker/Dockerfile.relay
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.relay
     ports:
       - "8041:8041"
     env_file: .env
@@ -83,14 +83,14 @@ services:
 
   # ─── Web Console (Next.js) ───────────────────────────────────
   web:
-    image: ghcr.io/theonlytruebigmac/screencontrol/web:latest
+    # image: ghcr.io/theonlytruebigmac/screencontrol/web:latest
     # To build locally instead of pulling from GHCR, uncomment:
-    # build:
-    #   context: .
-    #   dockerfile: docker/Dockerfile.web
-    #   args:
-    #     NEXT_PUBLIC_API_URL: http://172.16.103.242:8080/api
-    #     NEXT_PUBLIC_WS_URL: ws://172.16.103.242:8080/ws
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_URL: http://172.16.103.242:8080/api
+        NEXT_PUBLIC_WS_URL: ws://172.16.103.242:8080/ws
     ports:
       - "3000:3000"
     depends_on:

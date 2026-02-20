@@ -15,7 +15,8 @@ import { useSearchParams } from 'next/navigation';
 import ChatPanel from '@/components/chat-panel';
 import type { DesktopViewerHandle, ViewerStatus } from '@/components/desktop-viewer';
 import type { MonitorInfo } from '@/lib/proto';
-import { encodeKeyEvent, encodeClipboardData, encodeMonitorSwitch, encodeQualitySettings } from '@/lib/proto';
+import { encodeKeyEvent, encodeClipboardData, encodeMonitorSwitch, encodeQualitySettings, encodeHostCommand } from '@/lib/proto';
+import type { HostCommandType } from '@/lib/proto';
 import {
   ArrowLeft,
   Monitor,
@@ -39,6 +40,12 @@ import {
   RefreshCw,
   MonitorSmartphone,
   Gauge,
+  Shield,
+  ShieldOff,
+  MonitorOff,
+  Coffee,
+  ShieldAlert,
+  RotateCw,
 } from 'lucide-react';
 import { useToast } from '@/components/toast';
 
@@ -102,6 +109,14 @@ export default function DesktopPage({ params }: PageProps) {
   const [qualityPreset, setQualityPreset] = useState<'auto' | 'low' | 'medium' | 'high' | 'ultra'>('auto');
   const [autoQualityTier, setAutoQualityTier] = useState('Auto');
   const qualityRef = useRef<HTMLDivElement>(null);
+
+  // Session control state
+  const [showSessionControl, setShowSessionControl] = useState(false);
+  const [blockInput, setBlockInput] = useState(false);
+  const [blankScreen, setBlankScreen] = useState(false);
+  const [wakeLock, setWakeLock] = useState(false);
+  const [confirmReboot, setConfirmReboot] = useState<'normal' | 'safe' | null>(null);
+  const sessionControlRef = useRef<HTMLDivElement>(null);
 
   const pageRef = useRef<HTMLDivElement>(null);
   const keysRef = useRef<HTMLDivElement>(null);
@@ -206,6 +221,7 @@ export default function DesktopPage({ params }: PageProps) {
       if (keysRef.current && !keysRef.current.contains(e.target as Node)) setShowKeys(false);
       if (monitorsRef.current && !monitorsRef.current.contains(e.target as Node)) setShowMonitors(false);
       if (qualityRef.current && !qualityRef.current.contains(e.target as Node)) setShowQuality(false);
+      if (sessionControlRef.current && !sessionControlRef.current.contains(e.target as Node)) { setShowSessionControl(false); setConfirmReboot(null); }
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
@@ -571,11 +587,11 @@ export default function DesktopPage({ params }: PageProps) {
               <div className="absolute top-full left-0 mt-1 w-44 bg-[#1e1e1e] border border-[#444] rounded-lg shadow-2xl z-50 py-1" style={{ animation: 'fadeIn 0.15s ease' }}>
                 <div className="px-3 py-1.5 text-[10px] text-gray-600 uppercase tracking-wider">Quality</div>
                 {[
-                  { key: 'auto' as const, label: 'Auto', quality: 0, fps: 0, desc: 'Adaptive' },
-                  { key: 'low' as const, label: 'Low', quality: 25, fps: 15, desc: 'Low bandwidth' },
-                  { key: 'medium' as const, label: 'Medium', quality: 50, fps: 24, desc: 'Balanced' },
-                  { key: 'high' as const, label: 'High', quality: 75, fps: 30, desc: 'Clear' },
-                  { key: 'ultra' as const, label: 'Ultra', quality: 95, fps: 30, desc: 'Maximum' },
+                  { key: 'auto' as const, label: 'Auto', quality: 0, fps: 0, bitrate: 0, desc: 'Adaptive' },
+                  { key: 'low' as const, label: 'Low', quality: 25, fps: 15, bitrate: 1500, desc: 'Low bandwidth' },
+                  { key: 'medium' as const, label: 'Medium', quality: 50, fps: 24, bitrate: 3000, desc: 'Balanced' },
+                  { key: 'high' as const, label: 'High', quality: 75, fps: 30, bitrate: 5000, desc: 'Clear' },
+                  { key: 'ultra' as const, label: 'Ultra', quality: 95, fps: 30, bitrate: 8000, desc: 'Maximum' },
                 ].map((preset) => (
                   <button
                     key={preset.key}
@@ -587,7 +603,7 @@ export default function DesktopPage({ params }: PageProps) {
                           handle.setAutoQuality(true);
                         } else {
                           handle.setAutoQuality(false);
-                          handle.sendInput(encodeQualitySettings(sessionId, preset.quality, preset.fps));
+                          handle.sendInput(encodeQualitySettings(sessionId, preset.quality, preset.fps, preset.bitrate));
                         }
                       }
                       setShowQuality(false);
@@ -602,6 +618,155 @@ export default function DesktopPage({ params }: PageProps) {
                     <span className="text-[9px] text-gray-600">{preset.desc}</span>
                   </button>
                 ))}
+              </div>
+            )}
+          </div>
+
+          <div className="w-px h-3.5 bg-[#333] mx-0.5" />
+
+          {/* Session Control */}
+          <div className="relative" ref={sessionControlRef}>
+            <button
+              onClick={() => { setShowSessionControl(!showSessionControl); setConfirmReboot(null); }}
+              className={`flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded border transition-colors ${showSessionControl
+                ? 'bg-[#e05246]/10 border-[#e05246]/30 text-[#e05246]'
+                : (blockInput || blankScreen || wakeLock)
+                  ? 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+                  : 'bg-[#141414] border-[#333] text-gray-500 hover:text-white hover:bg-white/5'
+                }`}
+              title="Session controls"
+            >
+              <Shield className="w-3 h-3" />
+              <span>Controls</span>
+              <ChevronDown className="w-2.5 h-2.5" />
+            </button>
+            {showSessionControl && (
+              <div className="absolute top-full left-0 mt-1 w-56 bg-[#1e1e1e] border border-[#444] rounded-lg shadow-2xl z-50 py-1" style={{ animation: 'fadeIn 0.15s ease' }}>
+                <div className="px-3 py-1.5 text-[10px] text-gray-600 uppercase tracking-wider">Session Controls</div>
+
+                {/* Block Input toggle */}
+                <button
+                  onClick={() => {
+                    const next = !blockInput;
+                    setBlockInput(next);
+                    const handle = viewerRef.current;
+                    if (handle) handle.sendInput(encodeHostCommand(sessionId, 'block_input', next));
+                    if (next) info('Input Blocked', 'Guest mouse & keyboard disabled');
+                    else success('Input Restored', 'Guest input re-enabled');
+                  }}
+                  className={`w-full flex items-center justify-between px-3 py-2 text-xs transition-colors ${blockInput ? 'bg-amber-500/10 text-amber-400' : 'text-gray-300 hover:bg-white/5'
+                    }`}
+                >
+                  <span className="flex items-center gap-2">
+                    {blockInput ? <ShieldOff className="w-3.5 h-3.5" /> : <Shield className="w-3.5 h-3.5 text-gray-600" />}
+                    <span>Block Guest Input</span>
+                  </span>
+                  {blockInput && <span className="text-[9px] px-1.5 py-0.5 bg-amber-500/20 text-amber-400 rounded font-medium">ON</span>}
+                </button>
+
+                {/* Blank Screen toggle */}
+                <button
+                  onClick={() => {
+                    const next = !blankScreen;
+                    setBlankScreen(next);
+                    const handle = viewerRef.current;
+                    if (handle) handle.sendInput(encodeHostCommand(sessionId, 'blank_screen', next));
+                    if (next) info('Screen Blanked', 'Guest monitor turned off');
+                    else success('Screen Restored', 'Guest monitor turned on');
+                  }}
+                  className={`w-full flex items-center justify-between px-3 py-2 text-xs transition-colors ${blankScreen ? 'bg-amber-500/10 text-amber-400' : 'text-gray-300 hover:bg-white/5'
+                    }`}
+                >
+                  <span className="flex items-center gap-2">
+                    <MonitorOff className={`w-3.5 h-3.5 ${blankScreen ? '' : 'text-gray-600'}`} />
+                    <span>Blank Guest Screen</span>
+                  </span>
+                  {blankScreen && <span className="text-[9px] px-1.5 py-0.5 bg-amber-500/20 text-amber-400 rounded font-medium">ON</span>}
+                </button>
+
+                {/* Wake Lock toggle */}
+                <button
+                  onClick={() => {
+                    const next = !wakeLock;
+                    setWakeLock(next);
+                    const handle = viewerRef.current;
+                    if (handle) handle.sendInput(encodeHostCommand(sessionId, 'wake_lock', next));
+                    if (next) info('Wake Lock', 'Guest machine will stay awake');
+                    else success('Wake Lock Released', 'Guest may sleep/lock normally');
+                  }}
+                  className={`w-full flex items-center justify-between px-3 py-2 text-xs transition-colors ${wakeLock ? 'bg-amber-500/10 text-amber-400' : 'text-gray-300 hover:bg-white/5'
+                    }`}
+                >
+                  <span className="flex items-center gap-2">
+                    <Coffee className={`w-3.5 h-3.5 ${wakeLock ? '' : 'text-gray-600'}`} />
+                    <span>Keep Awake</span>
+                  </span>
+                  {wakeLock && <span className="text-[9px] px-1.5 py-0.5 bg-amber-500/20 text-amber-400 rounded font-medium">ON</span>}
+                </button>
+
+                <div className="h-px bg-[#333] my-1" />
+
+                {/* Reboot Normal */}
+                {confirmReboot === 'normal' ? (
+                  <div className="px-3 py-2 flex items-center justify-between">
+                    <span className="text-[10px] text-red-400 font-medium">Reboot machine?</span>
+                    <div className="flex gap-1">
+                      <button
+                        onClick={() => {
+                          const handle = viewerRef.current;
+                          if (handle) handle.sendInput(encodeHostCommand(sessionId, 'reboot_normal', true));
+                          info('Rebooting', 'Machine is restarting…');
+                          setConfirmReboot(null);
+                          setShowSessionControl(false);
+                        }}
+                        className="px-2 py-0.5 text-[10px] bg-red-500/20 text-red-400 rounded hover:bg-red-500/30 font-medium"
+                      >Yes</button>
+                      <button
+                        onClick={() => setConfirmReboot(null)}
+                        className="px-2 py-0.5 text-[10px] text-gray-500 rounded hover:bg-white/5"
+                      >Cancel</button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setConfirmReboot('normal')}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs text-gray-300 hover:bg-white/5 transition-colors"
+                  >
+                    <RotateCw className="w-3.5 h-3.5 text-gray-600" />
+                    <span>Reboot Machine</span>
+                  </button>
+                )}
+
+                {/* Reboot Safe Mode */}
+                {confirmReboot === 'safe' ? (
+                  <div className="px-3 py-2 flex items-center justify-between">
+                    <span className="text-[10px] text-red-400 font-medium">Reboot to Safe Mode?</span>
+                    <div className="flex gap-1">
+                      <button
+                        onClick={() => {
+                          const handle = viewerRef.current;
+                          if (handle) handle.sendInput(encodeHostCommand(sessionId, 'reboot_safe', true));
+                          info('Rebooting', 'Machine restarting to safe/rescue mode…');
+                          setConfirmReboot(null);
+                          setShowSessionControl(false);
+                        }}
+                        className="px-2 py-0.5 text-[10px] bg-red-500/20 text-red-400 rounded hover:bg-red-500/30 font-medium"
+                      >Yes</button>
+                      <button
+                        onClick={() => setConfirmReboot(null)}
+                        className="px-2 py-0.5 text-[10px] text-gray-500 rounded hover:bg-white/5"
+                      >Cancel</button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setConfirmReboot('safe')}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs text-gray-300 hover:bg-white/5 transition-colors"
+                  >
+                    <ShieldAlert className="w-3.5 h-3.5 text-gray-600" />
+                    <span>Reboot to Safe Mode</span>
+                  </button>
+                )}
               </div>
             )}
           </div>

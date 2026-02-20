@@ -6,11 +6,11 @@ import { ChevronRight, Home } from "lucide-react";
 
 const LABEL_MAP: Record<string, string> = {
     admin: "Admin",
-    agents: "Remote Access",
-    sessions: "Support",
+    agents: "Agents",
+    sessions: "Ad-Hoc",
     terminal: "Terminal",
     files: "Files",
-    desktop: "Meeting",
+    desktop: "Host",
     audit: "Audit Log",
     extensions: "Extensions",
     licensing: "Licensing",

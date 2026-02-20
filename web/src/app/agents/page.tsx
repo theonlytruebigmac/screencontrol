@@ -14,7 +14,7 @@ import { useEvents } from "@/lib/use-agent-status";
 
 const POLL_INTERVAL = 10_000;
 
-// ─── Main Access Page ─────────────────────────────────────────
+// ─── Main Agents Page ─────────────────────────────────────────
 
 export default function AgentsPage() {
     const router = useRouter();

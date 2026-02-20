@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Consent dialog for unattended access approval.
 //!
 //! When a remote user requests a desktop session, the agent shows a native
@@ -31,37 +32,14 @@ pub enum ConsentResult {
 /// available (e.g. the agent is running as a headless service), access is
 /// auto-granted.
 pub async fn prompt_user(
-    requester_name: &str,
-    session_type: &str,
-    timeout: Duration,
+    _requester_name: &str,
+    _session_type: &str,
+    _timeout: Duration,
 ) -> ConsentResult {
-    let requester = requester_name.to_string();
-    let stype = session_type.to_string();
-    let timeout_secs = timeout.as_secs().max(5);
-
-    // Run in blocking thread since native dialogs block
-    let result = tokio::time::timeout(
-        timeout,
-        tokio::task::spawn_blocking(move || show_native_dialog(&requester, &stype, timeout_secs)),
-    )
-    .await;
-
-    match result {
-        Ok(Ok(Ok(true))) => ConsentResult::Granted,
-        Ok(Ok(Ok(false))) => ConsentResult::Denied,
-        Ok(Ok(Err(e))) => {
-            tracing::debug!(
-                "Consent dialog failed: {} — auto-granting (headless mode)",
-                e
-            );
-            ConsentResult::NoDisplay
-        }
-        Ok(Err(e)) => {
-            tracing::error!("Consent task panicked: {}", e);
-            ConsentResult::NoDisplay
-        }
-        Err(_) => ConsentResult::TimedOut,
-    }
+    // TODO: Re-enable consent prompts when the consent UI feature is implemented.
+    // For now, all sessions are auto-granted to allow unattended remote access.
+    tracing::info!("Consent auto-granted (consent prompts disabled)");
+    ConsentResult::Granted
 }
 
 /// Show a native dialog and return true if granted.

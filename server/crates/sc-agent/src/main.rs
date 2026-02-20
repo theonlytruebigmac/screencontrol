@@ -15,13 +15,17 @@
 //! sc-agent version                                   # Print version info
 //! ```
 
+mod audio;
 mod chat;
 mod clipboard;
 mod command;
 mod connection;
 mod consent;
+mod cursor;
+mod encoder;
 mod ffmpeg;
 mod filebrowser;
+mod host_commands;
 mod input;
 mod screen;
 mod service;
@@ -33,6 +37,240 @@ mod updater;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
+/// On Linux, when running as a root system service, detect the active graphical
+/// session's environment variables (DISPLAY, WAYLAND_DISPLAY,
+/// DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR) by scanning /proc for a process
+/// that belongs to a logged-in graphical user. Without these, Mutter D-Bus
+/// screen capture and X11/Wayland input injection will fail.
+#[cfg(target_os = "linux")]
+fn adopt_graphical_session_env() {
+    use std::fs;
+
+    // Only needed when these aren't already set (i.e. running as a service).
+    // We must have DBUS_SESSION_BUS_ADDRESS *and* a display variable — sudo
+    // may preserve DISPLAY but strip DBUS_SESSION_BUS_ADDRESS.
+    let has_display = std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
+    let has_dbus = std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok();
+    if has_display && has_dbus {
+        tracing::info!("Display + D-Bus environment already set, skipping auto-detection");
+        return;
+    }
+
+    tracing::info!("Detecting active graphical session environment...");
+
+    // The env vars we want to inherit
+    let target_vars = [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+    ];
+
+    // Try to find a graphical session user via loginctl
+    let session_uid = find_graphical_session_uid();
+
+    // Scan /proc for a process with the needed env vars.
+    // We need at least DBUS_SESSION_BUS_ADDRESS to connect to Mutter.
+    // On modern GNOME/Wayland, gnome-shell's environ often lacks DISPLAY
+    // and WAYLAND_DISPLAY (those are set later by XWayland / child processes),
+    // so we accept DBUS_SESSION_BUS_ADDRESS alone and derive the rest.
+    let proc_entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!("Cannot read /proc: {}", e);
+            return;
+        }
+    };
+
+    for entry in proc_entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Only look at numeric (PID) directories
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        // If we have a target UID, filter by it
+        if let Some(uid) = session_uid {
+            if let Ok(status) = fs::read_to_string(entry.path().join("status")) {
+                let proc_uid = status
+                    .lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|s| s.parse::<u32>().ok());
+                if proc_uid != Some(uid) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+
+        // Read the process UID + GID for later use
+        let (proc_uid, proc_gid) = {
+            if let Ok(status) = fs::read_to_string(entry.path().join("status")) {
+                let uid = status
+                    .lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|s| s.parse::<u32>().ok());
+                let gid = status
+                    .lines()
+                    .find(|l| l.starts_with("Gid:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|s| s.parse::<u32>().ok());
+                (uid, gid)
+            } else {
+                (None, None)
+            }
+        };
+
+        // Skip root-owned processes (uid 0) — we want the session user
+        if proc_uid == Some(0) {
+            continue;
+        }
+
+        // Read the process environment
+        let environ_path = entry.path().join("environ");
+        let environ = match fs::read(&environ_path) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+
+        // Parse null-separated environment variables
+        let env_str = String::from_utf8_lossy(&environ);
+        let vars: std::collections::HashMap<&str, &str> = env_str
+            .split('\0')
+            .filter_map(|entry| entry.split_once('='))
+            .collect();
+
+        // Accept any process with DBUS_SESSION_BUS_ADDRESS — this is the minimum
+        // needed to connect to Mutter's D-Bus API. DISPLAY/WAYLAND_DISPLAY may not
+        // be in the process environ on GNOME Wayland (set by XWayland later).
+        let has_dbus = vars.contains_key("DBUS_SESSION_BUS_ADDRESS");
+
+        if has_dbus {
+            // Found a suitable process — adopt its display environment
+            for var_name in &target_vars {
+                if let Some(value) = vars.get(var_name) {
+                    tracing::info!("Adopted {}={} from PID {}", var_name, value, name_str);
+                    std::env::set_var(var_name, value);
+                }
+            }
+
+            // Derive missing display variables from XDG_RUNTIME_DIR if possible
+            if std::env::var("XDG_RUNTIME_DIR").is_err() {
+                // Derive from UID: /run/user/{uid}
+                if let Some(uid) = proc_uid {
+                    let runtime_dir = format!("/run/user/{}", uid);
+                    if std::path::Path::new(&runtime_dir).exists() {
+                        tracing::info!("Derived XDG_RUNTIME_DIR={}", runtime_dir);
+                        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+                    }
+                }
+            }
+
+            if std::env::var("WAYLAND_DISPLAY").is_err() {
+                if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+                    // Check if wayland-0 socket exists
+                    let wayland_path = format!("{}/wayland-0", xdg);
+                    if std::path::Path::new(&wayland_path).exists() {
+                        tracing::info!("Derived WAYLAND_DISPLAY=wayland-0");
+                        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+                    }
+                }
+            }
+
+            if std::env::var("DISPLAY").is_err() {
+                // Default X display for XWayland
+                std::env::set_var("DISPLAY", ":0");
+                tracing::info!("Set default DISPLAY=:0");
+            }
+
+            // Store the session user's UID/GID so screen capture can seteuid to it
+            if let Some(uid) = proc_uid {
+                std::env::set_var("SC_SESSION_UID", uid.to_string());
+                tracing::info!("Set SC_SESSION_UID={}", uid);
+            }
+            if let Some(gid) = proc_gid {
+                std::env::set_var("SC_SESSION_GID", gid.to_string());
+                tracing::info!("Set SC_SESSION_GID={}", gid);
+            }
+            tracing::info!(
+                "Successfully adopted graphical session environment from PID {}",
+                name_str
+            );
+            return;
+        }
+    }
+
+    tracing::warn!("Could not find an active graphical session to adopt environment from");
+}
+
+/// Find the UID of the first active graphical session via loginctl.
+#[cfg(target_os = "linux")]
+fn find_graphical_session_uid() -> Option<u32> {
+    use std::process::Command;
+
+    // List sessions and find a graphical one
+    let output = Command::new("loginctl")
+        .args(["list-sessions", "--no-legend"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let session_id = parts[0];
+
+        // Check if this session has Type=wayland or Type=x11
+        let show_output = Command::new("loginctl")
+            .args(["show-session", session_id, "-p", "Type", "-p", "Uid"])
+            .output()
+            .ok()?;
+        let show_str = String::from_utf8_lossy(&show_output.stdout);
+
+        let mut session_type = "";
+        let mut uid: Option<u32> = None;
+
+        for prop_line in show_str.lines() {
+            if let Some(val) = prop_line.strip_prefix("Type=") {
+                session_type = if val == "wayland" || val == "x11" {
+                    val
+                } else {
+                    ""
+                };
+            }
+            if let Some(val) = prop_line.strip_prefix("Uid=") {
+                uid = val.parse().ok();
+            }
+        }
+
+        if !session_type.is_empty() {
+            if let Some(u) = uid {
+                tracing::info!(
+                    "Found graphical session {} (type={}, uid={})",
+                    session_id,
+                    session_type,
+                    u
+                );
+                return Some(u);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn adopt_graphical_session_env() {
+    // Not needed on macOS/Windows — those platforms handle session access differently
+}
+
 fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
@@ -41,6 +279,9 @@ fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // On Linux, adopt the active graphical session's environment if running as a service
+    adopt_graphical_session_env();
 
     // Parse CLI subcommand and flags
     let args: Vec<String> = std::env::args().collect();

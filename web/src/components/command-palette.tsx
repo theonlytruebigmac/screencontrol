@@ -53,9 +53,9 @@ interface CommandItem {
 
 const NAV_COMMANDS: CommandItem[] = [
     { id: "nav-home", label: "Dashboard", section: "Navigation", icon: LayoutDashboard, href: "/", keywords: ["home", "overview", "stats"] },
-    { id: "nav-access", label: "Remote Access", section: "Navigation", icon: KeyRound, href: "/agents", keywords: ["agents", "machines", "computers"] },
-    { id: "nav-support", label: "Support Sessions", section: "Navigation", icon: Headset, href: "/sessions", keywords: ["help", "support"] },
-    { id: "nav-meeting", label: "Meetings", section: "Navigation", icon: Video, href: "/desktop", keywords: ["video", "conference"] },
+    { id: "nav-agents", label: "Agents", section: "Navigation", icon: KeyRound, href: "/agents", keywords: ["agents", "machines", "computers"] },
+    { id: "nav-adhoc", label: "Ad-Hoc Sessions", section: "Navigation", icon: Headset, href: "/sessions", keywords: ["help", "support", "ad-hoc"] },
+    { id: "nav-host", label: "Host", section: "Navigation", icon: Video, href: "/desktop", keywords: ["video", "conference", "host"] },
     { id: "nav-terminal", label: "Terminal", section: "Navigation", icon: Terminal, href: "/terminal", keywords: ["shell", "console", "command"] },
     { id: "nav-files", label: "File Transfer", section: "Navigation", icon: HardDrive, href: "/files", keywords: ["upload", "download", "browse"] },
     { id: "nav-toolbox", label: "Toolbox", section: "Navigation", icon: Code2, href: "/toolbox", keywords: ["scripts", "powershell", "bash", "python"] },
@@ -79,8 +79,8 @@ const ADMIN_COMMANDS: CommandItem[] = [
 ];
 
 const ACTION_COMMANDS: CommandItem[] = [
-    { id: "action-support", label: "Create Support Session", section: "Actions", icon: Headset, href: "/sessions", keywords: ["support", "help", "code"] },
-    { id: "action-meeting", label: "Start Meeting", section: "Actions", icon: Video, href: "/desktop", keywords: ["video", "conference", "screen share"] },
+    { id: "action-adhoc", label: "Create Ad-Hoc Session", section: "Actions", icon: Headset, href: "/sessions", keywords: ["support", "help", "code", "ad-hoc"] },
+    { id: "action-host", label: "Start Host Session", section: "Actions", icon: Video, href: "/desktop", keywords: ["video", "conference", "screen share", "host"] },
     { id: "action-profile", label: "My Profile", section: "Actions", icon: UserCircle, href: "/profile", keywords: ["account", "settings", "avatar", "password"] },
     { id: "action-logout", label: "Sign Out", section: "Actions", icon: LogOut, keywords: ["logout", "exit"], action: () => { import('@/lib/auth-store').then(({ clearAuth }) => { clearAuth(); window.location.href = '/login'; }); } },
 ];

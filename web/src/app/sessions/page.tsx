@@ -40,9 +40,9 @@ const POLL_INTERVAL = 5000;
 
 type SessionFilter = "all" | "desktop" | "terminal" | "file_transfer";
 
-// ─── Support Code Generator ─────────────────────────────────
+// ─── Ad-Hoc Code Generator ─────────────────────────────────
 
-function SupportCodeCard() {
+function AdHocCodeCard() {
     const [code, setCode] = useState<string | null>(null);
     const [link, setLink] = useState<string | null>(null);
     const [copied, setCopied] = useState<"code" | "link" | null>(null);
@@ -53,7 +53,7 @@ function SupportCodeCard() {
         setTimeout(() => {
             const newCode = Math.random().toString(36).substring(2, 8).toUpperCase();
             setCode(newCode);
-            setLink(`${window.location.origin}/support/${newCode}`);
+            setLink(`${window.location.origin}/adhoc/${newCode}`);
             setGenerating(false);
         }, 600);
     }, []);
@@ -71,7 +71,7 @@ function SupportCodeCard() {
                     <Headset className="w-4 h-4 text-[#e05246]" />
                 </div>
                 <div>
-                    <h3 className="text-sm font-semibold text-white">Create Support Session</h3>
+                    <h3 className="text-sm font-semibold text-white">Create Ad-Hoc Session</h3>
                     <p className="text-[10px] text-gray-500">Generate a code for your client</p>
                 </div>
             </div>
@@ -87,14 +87,14 @@ function SupportCodeCard() {
                     ) : (
                         <Plus className="w-4 h-4" />
                     )}
-                    Generate Support Code
+                    Generate Ad-Hoc Code
                 </button>
             ) : (
                 <div className="space-y-3">
-                    {/* Support code */}
+                    {/* Ad-hoc code */}
                     <div>
                         <label className="text-[10px] uppercase tracking-wider text-gray-500 mb-1 block">
-                            Support Code
+                            Ad-Hoc Code
                         </label>
                         <div className="flex items-center gap-2">
                             <div className="flex-1 bg-[#141414] border border-[#333] rounded-lg px-4 py-3 text-center">
@@ -116,7 +116,7 @@ function SupportCodeCard() {
                         </div>
                     </div>
 
-                    {/* Support link */}
+                    {/* Ad-hoc link */}
                     <div>
                         <label className="text-[10px] uppercase tracking-wider text-gray-500 mb-1 block">
                             Direct Link
@@ -401,7 +401,7 @@ const FILTER_TABS: { key: SessionFilter; label: string; icon: typeof Monitor }[]
 
 // ─── Main Page ───────────────────────────────────────────────
 
-export default function SupportPage() {
+export default function AdHocPage() {
     const router = useRouter();
     const [sessions, setSessions] = useState<Session[]>([]);
     const [agents, setAgents] = useState<Agent[]>([]);
@@ -496,20 +496,20 @@ export default function SupportPage() {
 
     return (
         <div className="flex h-full bg-[#141414]">
-            {/* Left panel — Support code */}
+            {/* Left panel — Ad-hoc code */}
             <div className="w-[280px] border-r border-[#333] flex flex-col">
                 <div className="px-4 py-3 border-b border-[#333]">
                     <div className="flex items-center gap-2">
                         <Headset className="w-5 h-5 text-[#e05246]" />
                         <div>
-                            <h2 className="text-base font-bold text-white">Support</h2>
+                            <h2 className="text-base font-bold text-white">Ad-Hoc</h2>
                             <p className="text-[10px] text-gray-500">Ad-hoc remote sessions</p>
                         </div>
                     </div>
                 </div>
 
                 <div className="p-3 flex-1 overflow-y-auto space-y-3">
-                    <SupportCodeCard />
+                    <AdHocCodeCard />
 
                     {/* Quick stats */}
                     <div className="grid grid-cols-2 gap-2">
@@ -530,7 +530,7 @@ export default function SupportPage() {
                 {/* Toolbar with tabs */}
                 <div className="border-b border-[#333]">
                     <div className="flex items-center gap-3 px-4 py-2.5">
-                        <h3 className="text-sm font-semibold text-white">Support Sessions</h3>
+                        <h3 className="text-sm font-semibold text-white">Ad-Hoc Sessions</h3>
                         <div className="flex-1" />
                         <div className="relative">
                             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-600" />
@@ -585,8 +585,8 @@ export default function SupportPage() {
                     ) : activeSessions.length === 0 && recentSessions.length === 0 ? (
                         <EmptyState
                             icon={Headset}
-                            title="No support sessions"
-                            description="Generate a support code on the left panel to start a remote session with a client."
+                            title="No ad-hoc sessions"
+                            description="Generate an ad-hoc code on the left panel to start a remote session with a client."
                             color="#e05246"
                         />
                     ) : (

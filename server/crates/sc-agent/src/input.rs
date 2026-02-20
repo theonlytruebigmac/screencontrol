@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Input injection for remote desktop sessions.
 //!
 //! Platform-specific backends:
@@ -8,6 +9,80 @@
 //! - **Fallback**: `enigo` crate (X11 / macOS / Windows).
 
 use sc_protocol::input_event;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+/// Tracks pressed keys and mouse buttons with timestamps.
+/// Used to detect and release "stuck" keys when sessions drop or timeout.
+pub struct KeyTracker {
+    /// Maps key code → press timestamp
+    pressed_keys: HashMap<u32, Instant>,
+    /// Maps button id → press timestamp
+    pressed_buttons: HashMap<u32, Instant>,
+}
+
+impl KeyTracker {
+    pub fn new() -> Self {
+        Self {
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+        }
+    }
+
+    /// Record a key press or release.
+    pub fn track_key(&mut self, key_code: u32, pressed: bool) {
+        if pressed {
+            self.pressed_keys.insert(key_code, Instant::now());
+        } else {
+            self.pressed_keys.remove(&key_code);
+        }
+    }
+
+    /// Record a mouse button press or release.
+    pub fn track_button(&mut self, button: u32, pressed: bool) {
+        if pressed {
+            self.pressed_buttons.insert(button, Instant::now());
+        } else {
+            self.pressed_buttons.remove(&button);
+        }
+    }
+
+    /// Returns key codes that have been held longer than `max_duration`.
+    pub fn stuck_keys(&self, max_duration: Duration) -> Vec<u32> {
+        let now = Instant::now();
+        self.pressed_keys
+            .iter()
+            .filter(|(_, ts)| now.duration_since(**ts) > max_duration)
+            .map(|(code, _)| *code)
+            .collect()
+    }
+
+    /// Returns button ids that have been held longer than `max_duration`.
+    pub fn stuck_buttons(&self, max_duration: Duration) -> Vec<u32> {
+        let now = Instant::now();
+        self.pressed_buttons
+            .iter()
+            .filter(|(_, ts)| now.duration_since(**ts) > max_duration)
+            .map(|(btn, _)| *btn)
+            .collect()
+    }
+
+    /// Remove all tracked keys and buttons (call on session end).
+    pub fn clear(&mut self) {
+        self.pressed_keys.clear();
+        self.pressed_buttons.clear();
+    }
+
+    /// Number of currently pressed keys.
+    pub fn key_count(&self) -> usize {
+        self.pressed_keys.len()
+    }
+
+    /// Number of currently pressed buttons.
+    pub fn button_count(&self) -> usize {
+        self.pressed_buttons.len()
+    }
+}
 
 /// Handles input injection for desktop sessions.
 pub enum InputInjector {
@@ -229,6 +304,10 @@ impl MutterInputInjector {
                     self.notify_keyboard_keycode(evdev_code, key.pressed);
                 }
             }
+            Some(input_event::Event::RelativeMouseMove(rel)) => {
+                tracing::trace!(dx = rel.dx, dy = rel.dy, "RelativeMouseMove (D-Bus)");
+                self.notify_pointer_motion_relative(rel.dx as f64, rel.dy as f64);
+            }
             None => {}
         }
     }
@@ -249,6 +328,25 @@ impl MutterInputInjector {
                 .await
             {
                 tracing::warn!("NotifyPointerMotionAbsolute failed: {}", e);
+            }
+        });
+    }
+
+    fn notify_pointer_motion_relative(&self, dx: f64, dy: f64) {
+        let conn = self.connection.clone();
+        let path = self.rd_session_path.clone();
+        let _ = self.rt.spawn(async move {
+            if let Err(e) = conn
+                .call_method(
+                    Some("org.gnome.Mutter.RemoteDesktop"),
+                    path.as_ref(),
+                    Some("org.gnome.Mutter.RemoteDesktop.Session"),
+                    "NotifyPointerMotionRelative",
+                    &(dx, dy),
+                )
+                .await
+            {
+                tracing::warn!("NotifyPointerMotionRelative failed: {}", e);
             }
         });
     }
@@ -449,6 +547,14 @@ fn map_web_keycode_to_evdev(web_code: u32) -> Option<u32> {
 pub struct CoreGraphicsInputInjector {
     screen_width: u32,
     screen_height: u32,
+    /// Bitmask of currently held mouse buttons (bit 0=left, bit 1=right, bit 2=middle)
+    buttons_down: u8,
+    /// Timestamp of the last mouse-down event (for double-click detection)
+    last_click_time: Option<std::time::Instant>,
+    /// Current click count (1=single, 2=double, 3=triple)
+    click_count: i64,
+    /// Current modifier flags bitmask (CGEventFlags)
+    modifier_flags: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -472,6 +578,16 @@ mod cg_ffi {
     pub const K_CG_EVENT_SCROLL_WHEEL: u32 = 22;
     pub const K_CG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
     pub const K_CG_EVENT_OTHER_MOUSE_UP: u32 = 26;
+    pub const K_CG_EVENT_OTHER_MOUSE_DRAGGED: u32 = 27;
+
+    // CGEventField values for SetIntegerValueField
+    pub const K_CG_MOUSE_EVENT_CLICK_STATE: u32 = 1;
+
+    // CGEventFlags bitmask constants
+    pub const K_CG_EVENT_FLAG_SHIFT: u64 = 0x00020000;
+    pub const K_CG_EVENT_FLAG_CONTROL: u64 = 0x00040000;
+    pub const K_CG_EVENT_FLAG_ALTERNATE: u64 = 0x00080000; // Option/Alt
+    pub const K_CG_EVENT_FLAG_COMMAND: u64 = 0x00100000;
 
     // CGEventTapLocation
     pub const K_CG_HID_EVENT_TAP: u32 = 0;
@@ -517,12 +633,19 @@ mod cg_ffi {
 
         pub fn CGEventPost(tap: u32, event: CGEventRef);
 
+        pub fn CGEventSetFlags(event: CGEventRef, flags: u64);
+
+        pub fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+
         pub fn CFRelease(cf: *const c_void);
     }
 }
 
 #[cfg(target_os = "macos")]
 impl CoreGraphicsInputInjector {
+    /// Double-click interval in milliseconds (macOS default is ~500ms).
+    const DOUBLE_CLICK_INTERVAL_MS: u128 = 500;
+
     pub fn new(screen_width: u32, screen_height: u32) -> Self {
         tracing::info!(
             screen_width,
@@ -532,6 +655,10 @@ impl CoreGraphicsInputInjector {
         Self {
             screen_width,
             screen_height,
+            buttons_down: 0,
+            last_click_time: None,
+            click_count: 1,
+            modifier_flags: 0,
         }
     }
 
@@ -545,6 +672,18 @@ impl CoreGraphicsInputInjector {
             Some(input_event::Event::MouseButton(btn)) => {
                 let x = btn.x * self.screen_width as f64;
                 let y = btn.y * self.screen_height as f64;
+                // Track button state for drag event type selection
+                let bit = match btn.button {
+                    0 => 0x01, // left
+                    2 => 0x02, // right
+                    1 => 0x04, // middle
+                    _ => 0x01,
+                };
+                if btn.pressed {
+                    self.buttons_down |= bit;
+                } else {
+                    self.buttons_down &= !bit;
+                }
                 self.post_mouse_button(x, y, btn.button, btn.pressed);
             }
             Some(input_event::Event::MouseScroll(scroll)) => {
@@ -564,30 +703,121 @@ impl CoreGraphicsInputInjector {
             }
             Some(input_event::Event::KeyEvent(key)) => {
                 if let Some(vk) = map_web_keycode_to_macos(key.key_code) {
+                    // Track modifier flags for mouse events (1c)
+                    self.update_modifier_flags(vk, key.pressed);
                     self.post_key(vk, key.pressed);
                 }
             }
+            Some(input_event::Event::RelativeMouseMove(rel)) => {
+                self.post_relative_mouse_move(rel.dx, rel.dy);
+            }
             None => {}
+        }
+    }
+
+    /// Update tracked modifier flags based on virtual key code.
+    fn update_modifier_flags(&mut self, vk: u16, pressed: bool) {
+        let flag = match vk {
+            0x38 | 0x3C => cg_ffi::K_CG_EVENT_FLAG_SHIFT, // Shift L/R
+            0x3B | 0x3E => cg_ffi::K_CG_EVENT_FLAG_CONTROL, // Control L/R
+            0x3A | 0x3D => cg_ffi::K_CG_EVENT_FLAG_ALTERNATE, // Option L/R
+            0x37 | 0x36 => cg_ffi::K_CG_EVENT_FLAG_COMMAND, // Command L/R
+            _ => return,
+        };
+        if pressed {
+            self.modifier_flags |= flag;
+        } else {
+            self.modifier_flags &= !flag;
+        }
+    }
+
+    fn post_relative_mouse_move(&self, dx: i32, dy: i32) {
+        unsafe {
+            // Get current cursor position to warp from
+            let mut point = cg_ffi::CGPoint { x: 0.0, y: 0.0 };
+            // Use CGEventCreate+CGEventGetLocation to get current position
+            let event = cg_ffi::CGEventCreate(std::ptr::null());
+            if !event.is_null() {
+                point = cg_ffi::CGEventGetLocation(event);
+                cg_ffi::CFRelease(event as *const _);
+            }
+            let new_point = cg_ffi::CGPoint {
+                x: point.x + dx as f64,
+                y: point.y + dy as f64,
+            };
+            let event_type = if self.buttons_down & 0x01 != 0 {
+                cg_ffi::K_CG_EVENT_LEFT_MOUSE_DRAGGED
+            } else if self.buttons_down & 0x02 != 0 {
+                cg_ffi::K_CG_EVENT_RIGHT_MOUSE_DRAGGED
+            } else if self.buttons_down & 0x04 != 0 {
+                cg_ffi::K_CG_EVENT_OTHER_MOUSE_DRAGGED
+            } else {
+                cg_ffi::K_CG_EVENT_MOUSE_MOVED
+            };
+            let cg_button = cg_ffi::K_CG_MOUSE_BUTTON_LEFT;
+            let ev =
+                cg_ffi::CGEventCreateMouseEvent(std::ptr::null(), event_type, new_point, cg_button);
+            if !ev.is_null() {
+                cg_ffi::CGEventPost(cg_ffi::K_CG_HID_EVENT_TAP, ev);
+                cg_ffi::CFRelease(ev as *const _);
+            }
         }
     }
 
     fn post_mouse_move(&self, x: f64, y: f64) {
         unsafe {
             let point = cg_ffi::CGPoint { x, y };
-            let event = cg_ffi::CGEventCreateMouseEvent(
-                std::ptr::null(),
-                cg_ffi::K_CG_EVENT_MOUSE_MOVED,
-                point,
-                cg_ffi::K_CG_MOUSE_BUTTON_LEFT,
-            );
+            // Fix 1a: Use correct event type based on held buttons (drag vs move)
+            let (event_type, cg_button) = if self.buttons_down & 0x01 != 0 {
+                (
+                    cg_ffi::K_CG_EVENT_LEFT_MOUSE_DRAGGED,
+                    cg_ffi::K_CG_MOUSE_BUTTON_LEFT,
+                )
+            } else if self.buttons_down & 0x02 != 0 {
+                (
+                    cg_ffi::K_CG_EVENT_RIGHT_MOUSE_DRAGGED,
+                    cg_ffi::K_CG_MOUSE_BUTTON_RIGHT,
+                )
+            } else if self.buttons_down & 0x04 != 0 {
+                (
+                    cg_ffi::K_CG_EVENT_OTHER_MOUSE_DRAGGED,
+                    cg_ffi::K_CG_MOUSE_BUTTON_CENTER,
+                )
+            } else {
+                (
+                    cg_ffi::K_CG_EVENT_MOUSE_MOVED,
+                    cg_ffi::K_CG_MOUSE_BUTTON_LEFT,
+                )
+            };
+            let event =
+                cg_ffi::CGEventCreateMouseEvent(std::ptr::null(), event_type, point, cg_button);
             if !event.is_null() {
+                // Fix 1c: Set modifier flags on mouse events
+                if self.modifier_flags != 0 {
+                    cg_ffi::CGEventSetFlags(event, self.modifier_flags);
+                }
                 cg_ffi::CGEventPost(cg_ffi::K_CG_HID_EVENT_TAP, event);
                 cg_ffi::CFRelease(event);
             }
         }
     }
 
-    fn post_mouse_button(&self, x: f64, y: f64, button: u32, pressed: bool) {
+    fn post_mouse_button(&mut self, x: f64, y: f64, button: u32, pressed: bool) {
+        // Fix 1b: Track click count for double/triple click
+        if pressed {
+            let now = std::time::Instant::now();
+            if let Some(last) = self.last_click_time {
+                if last.elapsed().as_millis() <= Self::DOUBLE_CLICK_INTERVAL_MS {
+                    self.click_count += 1;
+                } else {
+                    self.click_count = 1;
+                }
+            } else {
+                self.click_count = 1;
+            }
+            self.last_click_time = Some(now);
+        }
+
         unsafe {
             let point = cg_ffi::CGPoint { x, y };
             let (event_type, cg_button) = match (button, pressed) {
@@ -620,14 +850,20 @@ impl CoreGraphicsInputInjector {
                     cg_ffi::K_CG_MOUSE_BUTTON_LEFT,
                 ),
             };
-            // Move to position first
-            let move_event = cg_ffi::CGEventCreateMouseEvent(
-                std::ptr::null(),
-                cg_ffi::K_CG_EVENT_MOUSE_MOVED,
-                point,
-                cg_button,
-            );
+            // Move to position first (use correct drag type if button held)
+            let move_type = if self.buttons_down & 0x01 != 0 {
+                cg_ffi::K_CG_EVENT_LEFT_MOUSE_DRAGGED
+            } else if self.buttons_down & 0x02 != 0 {
+                cg_ffi::K_CG_EVENT_RIGHT_MOUSE_DRAGGED
+            } else {
+                cg_ffi::K_CG_EVENT_MOUSE_MOVED
+            };
+            let move_event =
+                cg_ffi::CGEventCreateMouseEvent(std::ptr::null(), move_type, point, cg_button);
             if !move_event.is_null() {
+                if self.modifier_flags != 0 {
+                    cg_ffi::CGEventSetFlags(move_event, self.modifier_flags);
+                }
                 cg_ffi::CGEventPost(cg_ffi::K_CG_HID_EVENT_TAP, move_event);
                 cg_ffi::CFRelease(move_event);
             }
@@ -635,6 +871,18 @@ impl CoreGraphicsInputInjector {
             let click_event =
                 cg_ffi::CGEventCreateMouseEvent(std::ptr::null(), event_type, point, cg_button);
             if !click_event.is_null() {
+                // Fix 1b: Set click count for double/triple click
+                if self.click_count > 1 {
+                    cg_ffi::CGEventSetIntegerValueField(
+                        click_event,
+                        cg_ffi::K_CG_MOUSE_EVENT_CLICK_STATE,
+                        self.click_count,
+                    );
+                }
+                // Fix 1c: Set modifier flags on click events
+                if self.modifier_flags != 0 {
+                    cg_ffi::CGEventSetFlags(click_event, self.modifier_flags);
+                }
                 cg_ffi::CGEventPost(cg_ffi::K_CG_HID_EVENT_TAP, click_event);
                 cg_ffi::CFRelease(click_event);
             }
@@ -666,6 +914,23 @@ impl CoreGraphicsInputInjector {
                 cg_ffi::CFRelease(event);
             }
         }
+        // Phase 4: 12ms busy-wait after keyboard events.
+        // macOS `thread::sleep` is unreliable when running as a LaunchAgent
+        // under launchctl. The kernel may suspend the thread for much longer
+        // than requested, causing dropped keystrokes. A spin loop guarantees
+        // the minimum delay that macOS needs between keyboard events.
+        Self::key_sleep();
+    }
+
+    /// Busy-wait for 12ms to let macOS process the keyboard event.
+    /// Using `Instant`-based spin loop instead of `thread::sleep` because
+    /// sleep is unreliable under launchctl (may oversleep by 10-100x).
+    #[inline]
+    fn key_sleep() {
+        let target = Instant::now() + Duration::from_micros(12_000);
+        while Instant::now() < target {
+            std::hint::spin_loop();
+        }
     }
 
     /// Release all modifier keys (Shift, Ctrl, Option, Command).
@@ -680,6 +945,8 @@ impl CoreGraphicsInputInjector {
         ] {
             self.post_key(vk, false);
         }
+        self.modifier_flags = 0;
+        self.buttons_down = 0;
     }
 }
 
@@ -883,6 +1150,11 @@ impl EnigoInputInjector {
                     }
                 }
             }
+            Some(input_event::Event::RelativeMouseMove(rel)) => {
+                if let Err(e) = self.enigo.move_mouse(rel.dx, rel.dy, Coordinate::Rel) {
+                    tracing::warn!("enigo relative move_mouse failed: {:?}", e);
+                }
+            }
             None => {}
         }
     }
@@ -1011,9 +1283,14 @@ mod win32_ffi {
     pub const MOUSEEVENTF_WHEEL: u32 = 0x0800;
     pub const MOUSEEVENTF_HWHEEL: u32 = 0x1000;
     pub const MOUSEEVENTF_ABSOLUTE: u32 = 0x8000;
+    pub const MOUSEEVENTF_VIRTUALDESKTOP: u32 = 0x4000;
 
     // Keyboard event flags
+    pub const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
     pub const KEYEVENTF_KEYUP: u32 = 0x0002;
+
+    // MapVirtualKey translation type
+    pub const MAPVK_VK_TO_VSC: u32 = 0;
 
     pub const WHEEL_DELTA: i32 = 120;
 
@@ -1054,10 +1331,32 @@ mod win32_ffi {
     extern "system" {
         pub fn SendInput(c_inputs: u32, p_inputs: *const INPUT, cb_size: c_int) -> u32;
         pub fn GetSystemMetrics(n_index: c_int) -> c_int;
+        pub fn MapVirtualKeyW(u_code: u32, u_map_type: u32) -> u32;
+        pub fn OpenDesktopW(
+            lpsz_desktop: *const u16,
+            dw_flags: u32,
+            f_inherit: i32,
+            dw_desired_access: u32,
+        ) -> *mut std::ffi::c_void;
+        pub fn SetThreadDesktop(h_desktop: *mut std::ffi::c_void) -> i32;
+        pub fn CloseDesktop(h_desktop: *mut std::ffi::c_void) -> i32;
+        pub fn GetThreadDesktop(dw_thread_id: u32) -> *mut std::ffi::c_void;
+        pub fn GetCurrentThreadId() -> u32;
     }
+
+    /// Desktop access rights for OpenDesktop
+    pub const DESKTOP_SWITCHDESKTOP: u32 = 0x0100;
+    pub const GENERIC_ALL: u32 = 0x10000000;
 
     pub const SM_CXSCREEN: c_int = 0;
     pub const SM_CYSCREEN: c_int = 1;
+    pub const SM_XVIRTUALSCREEN: c_int = 76;
+    pub const SM_YVIRTUALSCREEN: c_int = 77;
+    pub const SM_CXVIRTUALSCREEN: c_int = 78;
+    pub const SM_CYVIRTUALSCREEN: c_int = 79;
+
+    /// Extra info value to tag our injected events (prevents feedback loops)
+    pub const SC_INPUT_EXTRA: usize = 100;
 }
 
 #[cfg(target_os = "windows")]
@@ -1079,6 +1378,9 @@ impl Win32InputInjector {
     }
 
     pub fn handle_event(&mut self, event: &sc_protocol::InputEvent) {
+        // Phase 3: Try to switch to the active desktop (UAC/login screen support)
+        self.try_change_desktop();
+
         match &event.event {
             Some(input_event::Event::MouseMove(mv)) => {
                 self.send_mouse_move(mv.x, mv.y);
@@ -1098,13 +1400,49 @@ impl Win32InputInjector {
                     self.send_key(vk, key.pressed);
                 }
             }
+            Some(input_event::Event::RelativeMouseMove(rel)) => {
+                self.send_relative_mouse_move(rel.dx, rel.dy);
+            }
             None => {}
         }
     }
 
+    fn send_relative_mouse_move(&self, dx: i32, dy: i32) {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            let mut input = std::mem::zeroed::<win32_ffi::INPUT>();
+            input.r#type = win32_ffi::INPUT_MOUSE;
+            input.u.mi.dx = dx;
+            input.u.mi.dy = dy;
+            input.u.mi.dwFlags = win32_ffi::MOUSEEVENTF_MOVE;
+            win32_ffi::SendInput(1, &input, std::mem::size_of::<win32_ffi::INPUT>() as i32);
+        }
+    }
+
     fn send_mouse_move(&self, norm_x: f64, norm_y: f64) {
-        // Use MonitorGeometry for multi-monitor offset-aware absolute coords
-        let (abs_x, abs_y) = self.geometry.to_absolute_65535(norm_x, norm_y);
+        // Fix 1d: Use virtual desktop metrics for multi-monitor support
+        let (virt_x, virt_y, virt_w, virt_h) = unsafe {
+            (
+                win32_ffi::GetSystemMetrics(win32_ffi::SM_XVIRTUALSCREEN),
+                win32_ffi::GetSystemMetrics(win32_ffi::SM_YVIRTUALSCREEN),
+                win32_ffi::GetSystemMetrics(win32_ffi::SM_CXVIRTUALSCREEN),
+                win32_ffi::GetSystemMetrics(win32_ffi::SM_CYVIRTUALSCREEN),
+            )
+        };
+
+        // Map normalized [0,1] coords to virtual desktop absolute [0,65535]
+        let pixel_x = (norm_x * self.geometry.total_width as f64) as i32;
+        let pixel_y = (norm_y * self.geometry.total_height as f64) as i32;
+        let abs_x = if virt_w > 0 {
+            ((pixel_x - virt_x) * 65535) / virt_w
+        } else {
+            (norm_x * 65535.0) as i32
+        };
+        let abs_y = if virt_h > 0 {
+            ((pixel_y - virt_y) * 65535) / virt_h
+        } else {
+            (norm_y * 65535.0) as i32
+        };
 
         let input = win32_ffi::INPUT {
             input_type: win32_ffi::INPUT_MOUSE,
@@ -1113,9 +1451,11 @@ impl Win32InputInjector {
                     dx: abs_x,
                     dy: abs_y,
                     mouse_data: 0,
-                    dw_flags: win32_ffi::MOUSEEVENTF_MOVE | win32_ffi::MOUSEEVENTF_ABSOLUTE,
+                    dw_flags: win32_ffi::MOUSEEVENTF_MOVE
+                        | win32_ffi::MOUSEEVENTF_ABSOLUTE
+                        | win32_ffi::MOUSEEVENTF_VIRTUALDESKTOP,
                     time: 0,
-                    dw_extra_info: 0,
+                    dw_extra_info: win32_ffi::SC_INPUT_EXTRA,
                 }),
             },
         };
@@ -1145,7 +1485,7 @@ impl Win32InputInjector {
                     mouse_data: 0,
                     dw_flags: flags,
                     time: 0,
-                    dw_extra_info: 0,
+                    dw_extra_info: win32_ffi::SC_INPUT_EXTRA,
                 }),
             },
         };
@@ -1168,7 +1508,7 @@ impl Win32InputInjector {
                         mouse_data: amount as u32,
                         dw_flags: win32_ffi::MOUSEEVENTF_WHEEL,
                         time: 0,
-                        dw_extra_info: 0,
+                        dw_extra_info: win32_ffi::SC_INPUT_EXTRA,
                     }),
                 },
             };
@@ -1189,7 +1529,7 @@ impl Win32InputInjector {
                         mouse_data: amount as u32,
                         dw_flags: win32_ffi::MOUSEEVENTF_HWHEEL,
                         time: 0,
-                        dw_extra_info: 0,
+                        dw_extra_info: win32_ffi::SC_INPUT_EXTRA,
                     }),
                 },
             };
@@ -1200,21 +1540,42 @@ impl Win32InputInjector {
     }
 
     fn send_key(&self, vk: u16, pressed: bool) {
-        let flags = if pressed {
+        // Fix 1e: Derive scan code from VK code
+        let scan =
+            unsafe { win32_ffi::MapVirtualKeyW(vk as u32, win32_ffi::MAPVK_VK_TO_VSC) } as u16;
+
+        let mut flags = if pressed {
             0
         } else {
             win32_ffi::KEYEVENTF_KEYUP
         };
+
+        // Fix 1e: Detect extended keys (scan codes with 0xE0 prefix)
+        // Extended keys include: Insert, Delete, Home, End, PageUp, PageDown,
+        // Arrow keys, Numlock, Break, PrintScreen, Divide, Enter (numpad),
+        // Right-hand Ctrl and Alt, and Windows keys
+        let is_extended = matches!(
+            vk,
+            0x21..=0x28  // PageUp, PageDown, End, Home, Arrows
+            | 0x2C..=0x2E  // PrintScreen, Insert, Delete
+            | 0x5B | 0x5C | 0x5D  // LWin, RWin, Apps
+            | 0xA3 | 0xA5  // RControl, RMenu
+            | 0x6F  // VK_DIVIDE (numpad /)
+            | 0x90  // VK_NUMLOCK
+        );
+        if is_extended {
+            flags |= win32_ffi::KEYEVENTF_EXTENDEDKEY;
+        }
 
         let input = win32_ffi::INPUT {
             input_type: win32_ffi::INPUT_KEYBOARD,
             data: win32_ffi::InputUnion {
                 ki: std::mem::ManuallyDrop::new(win32_ffi::KEYBDINPUT {
                     w_vk: vk,
-                    w_scan: 0,
+                    w_scan: scan,
                     dw_flags: flags,
                     time: 0,
-                    dw_extra_info: 0,
+                    dw_extra_info: win32_ffi::SC_INPUT_EXTRA,
                 }),
             },
         };
@@ -1236,6 +1597,45 @@ impl Win32InputInjector {
         ];
         for &vk in modifiers {
             self.send_key(vk, false);
+        }
+    }
+
+    /// Attempt to switch to the currently active desktop.
+    /// This is needed for UAC prompts and login screens on Windows,
+    /// which run on a separate "Winlogon" desktop. Without this,
+    /// SendInput events won't reach the secure desktop.
+    fn try_change_desktop(&self) {
+        unsafe {
+            // Try "Winlogon" desktop first (UAC / login screen)
+            let winlogon_name: Vec<u16> = "Winlogon\0".encode_utf16().collect();
+            let h_desk = win32_ffi::OpenDesktopW(
+                winlogon_name.as_ptr(),
+                0,
+                0, // fInherit = FALSE
+                win32_ffi::GENERIC_ALL,
+            );
+            if !h_desk.is_null() {
+                let result = win32_ffi::SetThreadDesktop(h_desk);
+                if result != 0 {
+                    tracing::trace!("Switched to Winlogon desktop");
+                }
+                win32_ffi::CloseDesktop(h_desk);
+                if result != 0 {
+                    return; // Successfully switched
+                }
+            }
+
+            // Fall back to "Default" desktop
+            let default_name: Vec<u16> = "Default\0".encode_utf16().collect();
+            let h_desk =
+                win32_ffi::OpenDesktopW(default_name.as_ptr(), 0, 0, win32_ffi::GENERIC_ALL);
+            if !h_desk.is_null() {
+                let result = win32_ffi::SetThreadDesktop(h_desk);
+                if result != 0 {
+                    tracing::trace!("Switched to Default desktop");
+                }
+                win32_ffi::CloseDesktop(h_desk);
+            }
         }
     }
 }

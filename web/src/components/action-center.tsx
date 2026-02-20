@@ -1,16 +1,15 @@
 'use client';
 
 /**
- * Action Center — notification bell with slide-out panel.
+ * System Health — alert panel with slide-out notification center.
  * Shows alerts generated from live agent data:
  * offline agents, high CPU, high memory, high disk usage.
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import {
-    Bell,
-    X,
     AlertTriangle,
+    X,
     WifiOff,
     Shield,
     Clock,
@@ -233,9 +232,9 @@ export function ActionCenter() {
                 onClick={() => setOpen(!open)}
                 className={`relative p-2 rounded-lg transition-colors ${open ? 'bg-white/5 text-white' : 'text-gray-500 hover:text-white hover:bg-white/5'
                     }`}
-                title="Action Center"
+                title="System Health"
             >
-                <Bell className="w-4.5 h-4.5" />
+                <AlertTriangle className="w-4.5 h-4.5" />
                 {unreadCount > 0 && (
                     <span className="absolute -top-0.5 -right-0.5 w-4 h-4 bg-[#e05246] text-white text-[8px] font-bold rounded-full flex items-center justify-center border-2 border-[#141414]">
                         {unreadCount > 9 ? '9+' : unreadCount}
@@ -249,8 +248,8 @@ export function ActionCenter() {
                     {/* Header */}
                     <div className="flex items-center justify-between px-4 py-3 border-b border-[#333]">
                         <div className="flex items-center gap-2">
-                            <Bell className="w-4 h-4 text-[#e05246]" />
-                            <h3 className="text-sm font-semibold text-white">Action Center</h3>
+                            <AlertTriangle className="w-4 h-4 text-[#e05246]" />
+                            <h3 className="text-sm font-semibold text-white">System Health</h3>
                             {unreadCount > 0 && (
                                 <span className="px-1.5 py-0.5 bg-[#e05246]/15 text-[#e05246] text-[10px] font-medium rounded">
                                     {unreadCount}

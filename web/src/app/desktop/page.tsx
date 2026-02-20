@@ -16,7 +16,7 @@ import {
 import { EmptyState } from "@/components/empty-state";
 import { useToast } from "@/components/toast";
 
-interface Meeting {
+interface HostSession {
     id: string;
     code: string;
     host: string;
@@ -25,32 +25,32 @@ interface Meeting {
     status: "active" | "ended";
 }
 
-export default function MeetingPage() {
-    const [meetings, setMeetings] = useState<Meeting[]>([]);
+export default function HostPage() {
+    const [sessions, setSessions] = useState<HostSession[]>([]);
     const [joinCode, setJoinCode] = useState("");
     const [creating, setCreating] = useState(false);
     const [copied, setCopied] = useState<string | null>(null);
     const { info } = useToast();
 
-    const handleStartMeeting = useCallback(() => {
+    const handleStartSession = useCallback(() => {
         setCreating(true);
         setTimeout(() => {
             const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-            const meeting: Meeting = {
-                id: crypto.randomUUID(),
+            const session: HostSession = {
+                id: (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') ? crypto.randomUUID() : Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5'),
                 code,
                 host: "Admin",
                 participants: 1,
                 startedAt: new Date(),
                 status: "active",
             };
-            setMeetings((prev) => [meeting, ...prev]);
+            setSessions((prev) => [session, ...prev]);
             setCreating(false);
         }, 800);
     }, []);
 
-    const handleEndMeeting = useCallback((id: string) => {
-        setMeetings((prev) =>
+    const handleEndSession = useCallback((id: string) => {
+        setSessions((prev) =>
             prev.map((m) => (m.id === id ? { ...m, status: "ended" as const } : m))
         );
     }, []);
@@ -61,7 +61,7 @@ export default function MeetingPage() {
         setTimeout(() => setCopied(null), 2000);
     }, []);
 
-    const activeMeetings = meetings.filter((m) => m.status === "active");
+    const activeSessions = sessions.filter((m) => m.status === "active");
 
     return (
         <div className="flex h-full bg-[#141414]">
@@ -72,7 +72,7 @@ export default function MeetingPage() {
                     <div className="flex items-center gap-2">
                         <Video className="w-5 h-5 text-[#e05246]" />
                         <div>
-                            <h2 className="text-base font-bold text-white">Meeting</h2>
+                            <h2 className="text-base font-bold text-white">Host</h2>
                             <p className="text-[10px] text-gray-500">
                                 Host or join a shared session
                             </p>
@@ -89,7 +89,7 @@ export default function MeetingPage() {
                             </div>
                             <div>
                                 <h3 className="text-xs font-semibold text-white">
-                                    Host Meeting
+                                    Host Session
                                 </h3>
                                 <p className="text-[10px] text-gray-500">
                                     Share your screen with others
@@ -97,7 +97,7 @@ export default function MeetingPage() {
                             </div>
                         </div>
                         <button
-                            onClick={handleStartMeeting}
+                            onClick={handleStartSession}
                             disabled={creating}
                             className="w-full flex items-center justify-center gap-2 py-2 bg-[#e05246] hover:bg-[#c43d32] text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
                         >
@@ -106,7 +106,7 @@ export default function MeetingPage() {
                             ) : (
                                 <Plus className="w-3.5 h-3.5" />
                             )}
-                            Start Meeting
+                            Start Session
                         </button>
                     </div>
 
@@ -118,7 +118,7 @@ export default function MeetingPage() {
                             </div>
                             <div>
                                 <h3 className="text-xs font-semibold text-white">
-                                    Join Meeting
+                                    Join Session
                                 </h3>
                                 <p className="text-[10px] text-gray-500">
                                     Enter a code to connect
@@ -138,7 +138,7 @@ export default function MeetingPage() {
                             />
                             <button
                                 disabled={joinCode.length < 4}
-                                onClick={() => info("Coming Soon", "Meeting join will be available when a meeting backend is implemented")}
+                                onClick={() => info("Coming Soon", "Session join will be available when the host backend is implemented")}
                                 className="shrink-0 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-40"
                             >
                                 Join
@@ -150,7 +150,7 @@ export default function MeetingPage() {
                     <div className="grid grid-cols-2 gap-1.5">
                         <div className="bg-[#1e1e1e] border border-[#333] rounded-lg p-2.5 text-center">
                             <div className="text-base font-bold text-white">
-                                {activeMeetings.length}
+                                {activeSessions.length}
                             </div>
                             <div className="text-[9px] text-gray-500 uppercase tracking-wider">
                                 Active
@@ -158,7 +158,7 @@ export default function MeetingPage() {
                         </div>
                         <div className="bg-[#1e1e1e] border border-[#333] rounded-lg p-2.5 text-center">
                             <div className="text-base font-bold text-white">
-                                {meetings.length}
+                                {sessions.length}
                             </div>
                             <div className="text-[9px] text-gray-500 uppercase tracking-wider">
                                 Total
@@ -171,37 +171,37 @@ export default function MeetingPage() {
             {/* ─── Right Panel ─── */}
             <div className="flex-1 flex flex-col">
                 <div className="flex items-center gap-3 px-4 py-2.5 border-b border-[#333]">
-                    <h3 className="text-sm font-semibold text-white">Meetings</h3>
+                    <h3 className="text-sm font-semibold text-white">Host Sessions</h3>
                     <span className="text-[11px] text-gray-600">
-                        {activeMeetings.length} active
+                        {activeSessions.length} active
                     </span>
                 </div>
 
                 <div className="flex-1 overflow-y-auto">
-                    {meetings.length === 0 ? (
+                    {sessions.length === 0 ? (
                         <EmptyState
                             icon={Video}
-                            title="No meetings"
-                            description="Start a meeting to share your screen in real time with anyone using a simple code."
-                            actionLabel="Start Meeting"
-                            onAction={handleStartMeeting}
+                            title="No host sessions"
+                            description="Start a session to share your screen in real time with anyone using a simple code."
+                            actionLabel="Start Session"
+                            onAction={handleStartSession}
                             color="#e05246"
                         />
                     ) : (
-                        meetings.map((meeting) => {
+                        sessions.map((session) => {
                             const duration = (() => {
                                 const mins = Math.floor(
-                                    (Date.now() - meeting.startedAt.getTime()) / 60000
+                                    (Date.now() - session.startedAt.getTime()) / 60000
                                 );
                                 if (mins < 60) return `${mins}m`;
                                 return `${Math.floor(mins / 60)}h ${mins % 60}m`;
                             })();
-                            const link = `${typeof window !== "undefined" ? window.location.origin : ""}/meeting/${meeting.code}`;
-                            const isActive = meeting.status === "active";
+                            const link = `${typeof window !== "undefined" ? window.location.origin : ""}/host/${session.code}`;
+                            const isActive = session.status === "active";
 
                             return (
                                 <div
-                                    key={meeting.id}
+                                    key={session.id}
                                     className="px-4 py-3 border-b border-[#272727] hover:bg-white/[0.02] transition-colors"
                                 >
                                     <div className="flex items-center gap-3">
@@ -215,7 +215,7 @@ export default function MeetingPage() {
                                         <div className="flex-1 min-w-0">
                                             <div className="flex items-center gap-2">
                                                 <span className="text-sm font-medium text-white">
-                                                    Meeting {meeting.code}
+                                                    Session {session.code}
                                                 </span>
                                                 {isActive && (
                                                     <span className="flex items-center gap-1 text-[10px] text-emerald-400">
@@ -227,8 +227,8 @@ export default function MeetingPage() {
                                             <div className="flex items-center gap-2 text-[11px] text-gray-500">
                                                 <span className="flex items-center gap-1">
                                                     <Users className="w-3 h-3" />
-                                                    {meeting.participants} participant
-                                                    {meeting.participants !== 1
+                                                    {session.participants} participant
+                                                    {session.participants !== 1
                                                         ? "s"
                                                         : ""}
                                                 </span>
@@ -246,13 +246,13 @@ export default function MeetingPage() {
                                                         onClick={() =>
                                                             copyToClipboard(
                                                                 link,
-                                                                meeting.id
+                                                                session.id
                                                             )
                                                         }
                                                         className="p-1.5 bg-[#333] hover:bg-[#444] rounded transition-colors"
-                                                        title="Copy meeting link"
+                                                        title="Copy session link"
                                                     >
-                                                        {copied === meeting.id ? (
+                                                        {copied === session.id ? (
                                                             <Check className="w-3.5 h-3.5 text-emerald-400" />
                                                         ) : (
                                                             <Link2 className="w-3.5 h-3.5 text-gray-400" />
@@ -260,8 +260,8 @@ export default function MeetingPage() {
                                                     </button>
                                                     <button
                                                         onClick={() =>
-                                                            handleEndMeeting(
-                                                                meeting.id
+                                                            handleEndSession(
+                                                                session.id
                                                             )
                                                         }
                                                         className="px-2.5 py-1 bg-[#333] hover:bg-[#444] text-gray-400 text-[11px] rounded transition-colors"
@@ -284,7 +284,7 @@ export default function MeetingPage() {
                 </div>
 
                 <div className="px-4 py-2 border-t border-[#333] text-[11px] text-gray-600">
-                    {meetings.length} total meetings
+                    {sessions.length} total sessions
                 </div>
             </div>
         </div>

@@ -31,6 +31,11 @@ prost-types = { workspace = true }
 dirs = "6"
 libc = "0.2"
 arboard = "3"
+openh264 = { version = "0.9", features = ["source"] }
+
+# Audio capture + encoding
+cpal = "0.15"
+opus = "0.3"
 
 # Embedded WebView chat window (ScreenConnect-style)
 tao = "0.31"
