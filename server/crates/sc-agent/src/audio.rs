@@ -282,7 +282,7 @@ fn run_capture_loop(
 /// Get the best audio capture device for system audio loopback.
 #[allow(unreachable_code)]
 fn get_capture_device(host: &cpal::Host) -> Result<cpal::Device, Box<dyn std::error::Error>> {
-    use cpal::traits::HostTrait;
+    use cpal::traits::{DeviceTrait, HostTrait};
 
     // On Linux with PulseAudio/PipeWire, look for a monitor device
     #[cfg(target_os = "linux")]

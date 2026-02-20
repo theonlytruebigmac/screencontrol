@@ -14,7 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # ── System packages and cross-compilation toolchain ────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
-    build-essential \
+    build-essential cmake \
     gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
     libc6-dev-arm64-cross \
     pkg-config \
