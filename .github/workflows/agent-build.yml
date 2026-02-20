@@ -141,6 +141,10 @@ jobs:
           brew install protobuf pkg-config opus 2>/dev/null || true
 
       - name: Build sc-agent (x86_64-apple-darwin)
+        env:
+          # audiopus_sys builds opus from source via CMake when cross-compiling
+          # (brew opus is ARM64-only). Newer CMake removed < 3.5 compat.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           cargo build --manifest-path server/Cargo.toml \
             --package sc-agent --release --target x86_64-apple-darwin \
