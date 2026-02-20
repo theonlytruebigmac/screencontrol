@@ -138,12 +138,9 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          brew install protobuf pkg-config 2>/dev/null || true
+          brew install protobuf pkg-config opus 2>/dev/null || true
 
       - name: Build sc-agent (x86_64-apple-darwin)
-        env:
-          # Work around audiopus_sys CMake < 3.5 compatibility issue with newer CMake
-          CMAKE_POLICY_DEFAULT_CMP0000: OLD
         run: |
           cargo build --manifest-path server/Cargo.toml \
             --package sc-agent --release --target x86_64-apple-darwin \
