@@ -1413,13 +1413,24 @@ impl Win32InputInjector {
 
     fn send_relative_mouse_move(&self, dx: i32, dy: i32) {
         #[cfg(target_os = "windows")]
-        unsafe {
-            let mut input = std::mem::zeroed::<win32_ffi::INPUT>();
-            input.r#type = win32_ffi::INPUT_MOUSE;
-            input.u.mi.dx = dx;
-            input.u.mi.dy = dy;
-            input.u.mi.dwFlags = win32_ffi::MOUSEEVENTF_MOVE;
-            win32_ffi::SendInput(1, &input, std::mem::size_of::<win32_ffi::INPUT>() as i32);
+        {
+            let input = win32_ffi::INPUT {
+                input_type: win32_ffi::INPUT_MOUSE,
+                data: win32_ffi::InputUnion {
+                    mi: std::mem::ManuallyDrop::new(win32_ffi::MOUSEINPUT {
+                        dx,
+                        dy,
+                        mouse_data: 0,
+                        dw_flags: win32_ffi::MOUSEEVENTF_MOVE,
+                        time: 0,
+                        dw_extra_info: win32_ffi::SC_INPUT_EXTRA,
+                    }),
+                },
+            };
+
+            unsafe {
+                win32_ffi::SendInput(1, &input, std::mem::size_of::<win32_ffi::INPUT>() as i32);
+            }
         }
     }
 
