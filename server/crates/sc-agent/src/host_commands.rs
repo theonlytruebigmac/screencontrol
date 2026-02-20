@@ -20,16 +20,19 @@ static SCREEN_BLANKED: AtomicBool = AtomicBool::new(false);
 static WAKE_LOCKED: AtomicBool = AtomicBool::new(false);
 
 /// Whether guest input is currently blocked.
+#[allow(dead_code)]
 pub fn is_input_blocked() -> bool {
     INPUT_BLOCKED.load(Ordering::Relaxed)
 }
 
 /// Whether the guest screen is currently blanked.
+#[allow(dead_code)]
 pub fn is_screen_blanked() -> bool {
     SCREEN_BLANKED.load(Ordering::Relaxed)
 }
 
 /// Whether a wake lock is currently held.
+#[allow(dead_code)]
 pub fn is_wake_locked() -> bool {
     WAKE_LOCKED.load(Ordering::Relaxed)
 }

@@ -310,7 +310,7 @@ fn uninstall_systemd() -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 fn install_launchd(exe_path: &PathBuf) -> anyhow::Result<()> {
     let label = "com.screencontrol.agent";
-    let plist_path = format!("/Library/LaunchDaemons/{}.plist", label);
+    let plist_path = format!("/Library/LaunchAgents/{}.plist", label);
     let install_dir = exe_path.parent().unwrap_or(std::path::Path::new(
         "/Library/Application Support/ScreenControl",
     ));
@@ -447,7 +447,9 @@ fn install_launchd(exe_path: &PathBuf) -> anyhow::Result<()> {
             .push_str("            <key>RUST_LOG</key>\n            <string>info</string>\n");
     }
 
-    // ── Write LaunchDaemon plist pointing to the .app bundle binary ──
+    // ── Write LaunchAgent plist pointing to the .app bundle binary ──
+    // LaunchAgent runs in the user's GUI session, giving it Quartz display
+    // access for ScreenCaptureKit and CoreGraphics screen capture.
     let daemon_plist_content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -465,8 +467,8 @@ fn install_launchd(exe_path: &PathBuf) -> anyhow::Result<()> {
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>SessionCreate</key>
-    <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
     <key>StandardOutPath</key>
     <string>/var/log/screencontrol-agent.log</string>
     <key>StandardErrorPath</key>
@@ -484,27 +486,108 @@ fn install_launchd(exe_path: &PathBuf) -> anyhow::Result<()> {
     );
 
     std::fs::write(&plist_path, &daemon_plist_content)?;
-    tracing::info!("Wrote LaunchDaemon plist: {}", plist_path);
+    tracing::info!("Wrote LaunchAgent plist: {}", plist_path);
 
-    // Unload any existing daemon, then load the new one
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", "-w", &plist_path])
+    // Get the console user's UID for launchctl and file ownership
+    let console_uid = std::process::Command::new("stat")
+        .args(["-f", "%u", "/dev/console"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "501".to_string());
+
+    // Since the LaunchAgent runs as the console user (not root),
+    // we must chown log files, install dir, and data dir.
+    let log_files = [
+        "/var/log/screencontrol-agent.log",
+        "/var/log/screencontrol-agent.err",
+    ];
+    for log_file in &log_files {
+        // Create the file if it doesn't exist, then chown
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file);
+        let _ = std::process::Command::new("chown")
+            .args([&console_uid, *log_file])
+            .status();
+    }
+    // chown the install directory and data directory
+    let _ = std::process::Command::new("chown")
+        .args(["-R", &console_uid, &install_dir.to_string_lossy()])
         .status();
 
+    let gui_domain = format!("gui/{}", console_uid);
+
+    // Bootout any existing agent
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("{}/{}", gui_domain, label)])
+        .status();
+
+    // Load the LaunchAgent into the user's GUI domain.
+    // Since install runs as root (sudo), we use `launchctl asuser <uid>`
+    // to load the LaunchAgent into the correct user domain.
     let status = std::process::Command::new("launchctl")
-        .args(["load", "-w", &plist_path])
+        .args([
+            "asuser",
+            &console_uid,
+            "launchctl",
+            "load",
+            "-w",
+            &plist_path,
+        ])
         .status()?;
 
     if !status.success() {
-        anyhow::bail!("launchctl load failed — are you running as root (sudo)?");
+        // Fallback: try direct load (works if not running as root)
+        let _ = std::process::Command::new("launchctl")
+            .args(["load", "-w", &plist_path])
+            .status();
     }
 
-    println!("✅ LaunchDaemon installed and started: {}", label);
+    println!("✅ LaunchAgent installed and started: {}", label);
     println!("   App bundle: {}", app_dir.display());
     println!("   Logs: /var/log/screencontrol-agent.log");
-    println!("   Stop: sudo launchctl unload {}", plist_path);
+    println!("   Stop: sudo launchctl bootout {}/{}", gui_domain, label);
     println!();
     println!("   Run 'sc-agent setup' to grant Screen Recording & Accessibility permissions.");
+
+    // ── Pre-grant TCC permissions while running as root ──
+    // The setup window runs without root (via `open .app`), so it can't
+    // modify the system TCC database. We pre-grant all permissions here
+    // during install while we have root access.
+    let binary_path = bundle_exe.display().to_string();
+    let tcc_entries = [
+        "kTCCServiceScreenCapture",
+        "kTCCServiceAccessibility",
+        "kTCCServiceMicrophone",
+        "kTCCServiceSystemPolicyAllFiles",
+    ];
+    for service in &tcc_entries {
+        // Insert for bundle ID (client_type=0)
+        let _ = std::process::Command::new("sqlite3")
+            .args([
+                "/Library/Application Support/com.apple.TCC/TCC.db",
+                &format!(
+                    "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, flags) VALUES ('{}', '{}', 0, 2, 0, 1, 0);",
+                    service, label
+                ),
+            ])
+            .output();
+        // Insert for binary path (client_type=1)
+        let _ = std::process::Command::new("sqlite3")
+            .args([
+                "/Library/Application Support/com.apple.TCC/TCC.db",
+                &format!(
+                    "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, flags) VALUES ('{}', '{}', 1, 2, 0, 1, 0);",
+                    service, binary_path
+                ),
+            ])
+            .output();
+        tracing::info!("Granted TCC {} for {} and {}", service, label, binary_path);
+    }
+
     Ok(())
 }
 
@@ -512,14 +595,41 @@ fn install_launchd(exe_path: &PathBuf) -> anyhow::Result<()> {
 fn uninstall_launchd() -> anyhow::Result<()> {
     let label = "com.screencontrol.agent";
 
-    // Unload and remove LaunchDaemon
+    // Unload and remove LaunchAgent
+    let agent_plist = format!("/Library/LaunchAgents/{}.plist", label);
+
+    // Get console user UID for bootout
+    let console_uid = std::process::Command::new("stat")
+        .args(["-f", "%u", "/dev/console"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "501".to_string());
+
+    let gui_domain = format!("gui/{}", console_uid);
+
+    // Try bootout first (modern), then legacy unload
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("{}/{}", gui_domain, label)])
+        .status();
+
+    if std::path::Path::new(&agent_plist).exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", "-w", &agent_plist])
+            .status();
+        std::fs::remove_file(&agent_plist)?;
+        tracing::info!("Removed LaunchAgent plist: {}", agent_plist);
+    }
+
+    // Also clean up any legacy LaunchDaemon
     let daemon_plist = format!("/Library/LaunchDaemons/{}.plist", label);
     if std::path::Path::new(&daemon_plist).exists() {
         let _ = std::process::Command::new("launchctl")
             .args(["unload", "-w", &daemon_plist])
             .status();
-        std::fs::remove_file(&daemon_plist)?;
-        tracing::info!("Removed LaunchDaemon plist: {}", daemon_plist);
+        let _ = std::fs::remove_file(&daemon_plist);
+        tracing::info!("Removed legacy LaunchDaemon plist: {}", daemon_plist);
     }
 
     // Also clean up any legacy user LaunchAgent
@@ -554,6 +664,32 @@ fn uninstall_launchd() -> anyhow::Result<()> {
     if dt.exists() {
         let _ = std::fs::remove_dir_all(&dt);
     }
+
+    // ── Clean up TCC permission entries ──
+    // Reset TCC entries for both the bundle ID and the binary path
+    // so that reinstalling will properly prompt for permissions.
+    let tcc_services = [
+        "ScreenCapture",
+        "Accessibility",
+        "Microphone",
+        "SystemPolicyAllFiles",
+    ];
+    for service in &tcc_services {
+        // Reset by bundle ID
+        let _ = std::process::Command::new("tccutil")
+            .args(["reset", service, label])
+            .output();
+        tracing::info!("Reset TCC {} for {}", service, label);
+    }
+    // Also remove entries by binary path from the system TCC database
+    let binary_path = "/Library/Application Support/ScreenControl/sc-agent";
+    let _ = std::process::Command::new("sqlite3")
+        .args([
+            "/Library/Application Support/com.apple.TCC/TCC.db",
+            &format!("DELETE FROM access WHERE client='{}';", binary_path),
+        ])
+        .output();
+    tracing::info!("Cleaned TCC entries for binary path: {}", binary_path);
 
     println!("✅ Service uninstalled: {}", label);
     Ok(())

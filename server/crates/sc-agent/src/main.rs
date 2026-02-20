@@ -283,20 +283,38 @@ fn main() -> anyhow::Result<()> {
     // On Linux, adopt the active graphical session's environment if running as a service
     adopt_graphical_session_env();
 
-    // Parse CLI subcommand and flags
+    // Parse CLI subcommand and flags.
+    // Skip macOS-injected "-psn_*" arguments (Process Serial Number) that
+    // `open` adds when launching .app bundles.
     let args: Vec<String> = std::env::args().collect();
-    let subcommand = args.get(1).map(|s| s.as_str()).unwrap_or("run");
+    let subcommand = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with("-psn"))
+        .map(|s| s.as_str())
+        .unwrap_or("run");
 
     match subcommand {
         "install" => {
             let config = parse_install_flags(&args[2..])?;
             service::install(config)?;
             // Auto-launch setup on macOS only (TCC permissions)
+            // Launch via the .app bundle so macOS attributes TCC permissions
+            // to com.screencontrol.agent (the daemon's bundle ID)
             if cfg!(target_os = "macos") {
                 let silent = args.iter().any(|a| a == "--silent");
                 if !silent && !args.iter().any(|a| a == "--no-setup") {
                     println!("\nLaunching permission setup...");
-                    setup::run_setup();
+                    let app_path = "/Library/Application Support/ScreenControl/ScreenControl.app";
+                    let launched = std::process::Command::new("open")
+                        .args(["-n", app_path, "--args", "setup"])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if !launched {
+                        // Fallback: run setup in-process
+                        setup::run_setup();
+                    }
                 }
             }
             return Ok(());

@@ -638,6 +638,10 @@ mod cg_ffi {
         pub fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
 
         pub fn CFRelease(cf: *const c_void);
+
+        pub fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
+
+        pub fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     }
 }
 

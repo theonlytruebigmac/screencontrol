@@ -71,6 +71,7 @@ impl QualityConfig {
     }
 
     /// Get the effective max FPS, falling back to the platform default.
+    #[allow(dead_code)]
     pub fn effective_fps(&self, platform_default: u32) -> u32 {
         let v = self.max_fps.load(Ordering::Relaxed);
         if v == 0 {
@@ -525,6 +526,7 @@ fn is_h264_keyframe(data: &[u8]) -> bool {
 
 /// Parse H264 SPS NAL unit to extract resolution (width, height).
 /// Returns None if no SPS is found or parsing fails.
+#[allow(dead_code)]
 fn parse_h264_sps_resolution(data: &[u8]) -> Option<(u32, u32)> {
     // Find an SPS NAL unit (type 7)
     let mut i = 0;
@@ -551,6 +553,7 @@ fn parse_h264_sps_resolution(data: &[u8]) -> Option<(u32, u32)> {
 
 /// Parse SPS NAL unit payload to extract pic_width and pic_height in pixels.
 /// Uses minimal exp-Golomb decoding — only reads fields up to the resolution.
+#[allow(dead_code)]
 fn parse_sps_dimensions(sps: &[u8]) -> Option<(u32, u32)> {
     if sps.len() < 4 {
         return None;
@@ -757,6 +760,7 @@ fn send_cursor_update(
 /// Shared H264 stream reader: reads NAL units from a byte stream,
 /// wraps them in protobuf envelopes, and sends them over the WS channel.
 /// Returns the number of frames sent, or an error.
+#[allow(dead_code)]
 fn read_h264_stream(
     stdout: &mut dyn std::io::Read,
     session_id: &str,
@@ -1987,7 +1991,7 @@ mod macos {
                     "-s",
                     &format!("{}x{}", disp_width, disp_height),
                     "-r",
-                    &format!("{}", super::DEFAULT_FPS),
+                    &format!("{}", DEFAULT_FPS),
                     "-i",
                     "pipe:0",
                     "-c:v",
@@ -1996,12 +2000,16 @@ mod macos {
                     "1",
                     "-prio_speed",
                     "1",
+                    "-profile:v",
+                    "baseline", // lowest complexity, best for real-time
+                    "-allow_sw",
+                    "1", // allow software fallback
                     "-b:v",
                     &bitrate_str,
                     "-maxrate",
                     &maxrate_str,
                     "-g",
-                    "60", // keyframe every 60 frames
+                    "30", // keyframe every 30 frames (1s at 30fps)
                     "-bf",
                     "0", // no B-frames for lowest latency
                     "-flags",
@@ -2035,7 +2043,7 @@ mod macos {
             );
 
             let mut ffmpeg = ffmpeg_result.unwrap();
-            let mut ffmpeg_stdin = ffmpeg.stdin.take().unwrap();
+            let mut ffmpeg_stdin = Some(ffmpeg.stdin.take().unwrap());
             let ffmpeg_stdout = ffmpeg.stdout.take().unwrap();
 
             // Background thread: read H264 NAL units from FFmpeg stdout and send via WS
@@ -2044,11 +2052,12 @@ mod macos {
             let frame_seq = std::sync::Arc::new(AtomicU32::new(0));
             let frame_seq_reader = frame_seq.clone();
 
-            let mut reader_handle = std::thread::spawn(move || {
+            let mut reader_handle = Some(std::thread::spawn(move || {
                 use std::io::Read;
                 let mut stdout = ffmpeg_stdout;
                 let mut buffer = Vec::with_capacity(512 * 1024);
                 let mut read_buf = [0u8; 65536];
+                let mut seen_keyframe = false;
 
                 loop {
                     if ws_tx_h264.is_closed() {
@@ -2063,6 +2072,15 @@ mod macos {
                                 let seq = frame_seq_reader.fetch_add(1, Ordering::Relaxed);
                                 let nal_len = nal_unit.len();
                                 let is_keyframe = super::is_h264_keyframe(&nal_unit);
+
+                                // Drop P-frames until first keyframe (safe — decoder
+                                // can't decode without initial reference anyway)
+                                if !is_keyframe && !seen_keyframe {
+                                    continue;
+                                }
+                                if is_keyframe && !seen_keyframe {
+                                    seen_keyframe = true;
+                                }
 
                                 let envelope = Envelope {
                                     id: "f".to_string(),
@@ -2098,7 +2116,7 @@ mod macos {
                         Err(_) => break,
                     }
                 }
-            });
+            }));
 
             let frame_interval = std::time::Duration::from_millis(1000 / DEFAULT_FPS as u64);
             let mut next_frame_time = tokio::time::Instant::now();
@@ -2150,7 +2168,7 @@ mod macos {
 
                 // Write raw BGRA data to FFmpeg stdin (strip row padding if needed)
                 let write_result = if bytes_per_row == expected_stride {
-                    ffmpeg_stdin.write_all(bgra_slice)
+                    ffmpeg_stdin.as_mut().unwrap().write_all(bgra_slice)
                 } else {
                     // Row padding — write row by row
                     let mut ok = true;
@@ -2159,6 +2177,8 @@ mod macos {
                         let row_end = row_start + expected_stride;
                         if row_end <= bgra_slice.len() {
                             if ffmpeg_stdin
+                                .as_mut()
+                                .unwrap()
                                 .write_all(&bgra_slice[row_start..row_end])
                                 .is_err()
                             {
@@ -2204,15 +2224,17 @@ mod macos {
                             current_bitrate = new_bitrate;
 
                             // Kill current FFmpeg and wait for reader thread
-                            drop(ffmpeg_stdin);
+                            drop(ffmpeg_stdin.take());
                             let _ = ffmpeg.kill();
                             let _ = ffmpeg.wait();
-                            let _ = reader_handle.join();
+                            if let Some(rh) = reader_handle.take() {
+                                let _ = rh.join();
+                            }
 
                             // Respawn FFmpeg with new bitrate
                             match spawn_ffmpeg(p, disp_width, disp_height, current_bitrate) {
                                 Ok(mut new_ffmpeg) => {
-                                    ffmpeg_stdin = new_ffmpeg.stdin.take().unwrap();
+                                    ffmpeg_stdin = Some(new_ffmpeg.stdin.take().unwrap());
                                     let new_stdout = new_ffmpeg.stdout.take().unwrap();
                                     ffmpeg = new_ffmpeg;
 
@@ -2222,7 +2244,7 @@ mod macos {
                                     let fsr = frame_seq.clone();
                                     let dw = disp_width;
                                     let dh = disp_height;
-                                    reader_handle = std::thread::spawn(move || {
+                                    reader_handle = Some(std::thread::spawn(move || {
                                         use std::io::Read;
                                         let mut stdout = new_stdout;
                                         let mut buffer = Vec::with_capacity(512 * 1024);
@@ -2274,7 +2296,7 @@ mod macos {
                                                 Err(_) => break,
                                             }
                                         }
-                                    });
+                                    }));
 
                                     tracing::info!(
                                         "FFmpeg restarted with bitrate={}kbps",
@@ -2292,10 +2314,12 @@ mod macos {
             }
 
             // Clean up FFmpeg
-            drop(ffmpeg_stdin); // close stdin to signal EOF
+            drop(ffmpeg_stdin.take()); // close stdin to signal EOF
             let _ = ffmpeg.kill();
             let _ = ffmpeg.wait();
-            let _ = reader_handle.join();
+            if let Some(rh) = reader_handle.take() {
+                let _ = rh.join();
+            }
         } else if let Ok(mut sw_encoder) = crate::encoder::SoftwareEncoder::new(
             disp_width,
             disp_height,
@@ -2487,9 +2511,9 @@ mod macos {
                         let row_end = row_start + expected_stride;
                         if row_end <= bgra_slice.len() {
                             for chunk in bgra_slice[row_start..row_end].chunks_exact(4) {
-                                rgb_data.push(chunk[2]);
-                                rgb_data.push(chunk[1]);
-                                rgb_data.push(chunk[0]);
+                                rgb_data.push(chunk[2]); // R
+                                rgb_data.push(chunk[1]); // G
+                                rgb_data.push(chunk[0]); // B
                             }
                         }
                     }
@@ -2664,7 +2688,7 @@ mod macos {
                     "-f",
                     "rawvideo",
                     "-pix_fmt",
-                    "0rgb",
+                    "rgb0",
                     "-s",
                     &format!("{}x{}", init_width, init_height),
                     "-r",

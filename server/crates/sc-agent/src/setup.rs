@@ -36,10 +36,165 @@ enum SetupEvent {
 // ── macOS FFI declarations ────────────────────────────────────
 
 #[cfg(target_os = "macos")]
+#[allow(unused)]
 extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
     fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
+
+    // CoreFoundation
+    fn CFStringCreateWithCString(
+        allocator: *const std::ffi::c_void,
+        c_str: *const i8,
+        encoding: u32,
+    ) -> *const std::ffi::c_void;
+    fn CFDictionaryCreate(
+        allocator: *const std::ffi::c_void,
+        keys: *const *const std::ffi::c_void,
+        values: *const *const std::ffi::c_void,
+        num_values: isize,
+        key_callbacks: *const std::ffi::c_void,
+        value_callbacks: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    fn CFRelease(cf: *const std::ffi::c_void);
+
+    static kCFBooleanTrue: *const std::ffi::c_void;
+    static kCFTypeDictionaryKeyCallBacks: std::ffi::c_void;
+    static kCFTypeDictionaryValueCallBacks: std::ffi::c_void;
+
+    // Objective-C runtime
+    fn objc_getClass(name: *const i8) -> *mut std::ffi::c_void;
+    fn sel_registerName(name: *const i8) -> *mut std::ffi::c_void;
+    fn dlopen(path: *const i8, mode: i32) -> *mut std::ffi::c_void;
+}
+
+// Microphone permission request via Objective-C runtime block FFI.
+// We need a real Objective-C block to pass as completionHandler.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct CompletionBlock {
+    isa: *const std::ffi::c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: extern "C" fn(*mut CompletionBlock, bool),
+    descriptor: *const BlockDescr,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct BlockDescr {
+    reserved: usize,
+    size: usize,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn noop_block_invoke(_block: *mut CompletionBlock, _granted: bool) {}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    static _NSConcreteGlobalBlock: *const std::ffi::c_void;
+}
+
+#[cfg(target_os = "macos")]
+static NOOP_BLOCK_DESCRIPTOR: BlockDescr = BlockDescr {
+    reserved: 0,
+    size: std::mem::size_of::<CompletionBlock>(),
+};
+
+/// Trigger Screen Recording permission prompt.
+/// Adds ScreenControl to the Screen Recording list in System Settings.
+#[cfg(target_os = "macos")]
+fn prompt_screen_recording() {
+    unsafe {
+        CGRequestScreenCaptureAccess();
+    }
+}
+
+/// Trigger Accessibility permission prompt.
+/// Adds ScreenControl to the Accessibility list and shows the system prompt.
+#[cfg(target_os = "macos")]
+fn prompt_accessibility() {
+    unsafe {
+        let key_str = std::ffi::CString::new("AXTrustedCheckOptionPrompt").unwrap();
+        let key = CFStringCreateWithCString(
+            std::ptr::null(),
+            key_str.as_ptr(),
+            0x08000100, // kCFStringEncodingUTF8
+        );
+        let keys = [key];
+        let values = [kCFBooleanTrue];
+        let options = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            &kCFTypeDictionaryKeyCallBacks as *const _ as *const std::ffi::c_void,
+            &kCFTypeDictionaryValueCallBacks as *const _ as *const std::ffi::c_void,
+        );
+        AXIsProcessTrustedWithOptions(options);
+        CFRelease(key);
+        CFRelease(options);
+    }
+}
+
+/// Trigger Microphone permission prompt.
+/// Calls AVCaptureDevice.requestAccessForMediaType(.audio) via ObjC runtime.
+#[cfg(target_os = "macos")]
+fn prompt_microphone() {
+    unsafe {
+        let framework_path = std::ffi::CString::new(
+            "/System/Library/Frameworks/AVFoundation.framework/AVFoundation",
+        )
+        .unwrap();
+        dlopen(framework_path.as_ptr(), 0x1); // RTLD_LAZY
+
+        let av_class = objc_getClass(std::ffi::CString::new("AVCaptureDevice").unwrap().as_ptr());
+        if !av_class.is_null() {
+            let sel = sel_registerName(
+                std::ffi::CString::new("requestAccessForMediaType:completionHandler:")
+                    .unwrap()
+                    .as_ptr(),
+            );
+            let ns_string_class =
+                objc_getClass(std::ffi::CString::new("NSString").unwrap().as_ptr());
+            let string_sel = sel_registerName(
+                std::ffi::CString::new("stringWithUTF8String:")
+                    .unwrap()
+                    .as_ptr(),
+            );
+            let audio_cstr = std::ffi::CString::new("soun").unwrap();
+
+            let msg_send: extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const i8,
+            ) -> *mut std::ffi::c_void =
+                std::mem::transmute(objc_msgSend as *const std::ffi::c_void);
+            let media_type = msg_send(ns_string_class, string_sel, audio_cstr.as_ptr());
+
+            let block = Box::leak(Box::new(CompletionBlock {
+                isa: _NSConcreteGlobalBlock,
+                flags: (1 << 28),
+                reserved: 0,
+                invoke: noop_block_invoke,
+                descriptor: &NOOP_BLOCK_DESCRIPTOR,
+            }));
+
+            let request_send: extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const CompletionBlock,
+            ) = std::mem::transmute(objc_msgSend as *const std::ffi::c_void);
+            request_send(av_class, sel, media_type, block as *const CompletionBlock);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn objc_msgSend();
 }
 
 // ── Non-macOS stubs ──────────────────────────────────────────
@@ -67,23 +222,33 @@ fn check_full_disk_access() -> bool {
 // `CGPreflightScreenCaptureAccess()`, which only check the setup app's
 // own permissions and would incorrectly report "granted".
 
+/// The daemon's bundle ID for TCC lookups (client_type=0).
 #[allow(dead_code)]
 const DAEMON_BUNDLE_ID: &str = "com.screencontrol.agent";
 
-/// Query the system TCC database for a given service and bundle ID.
+/// The installed binary path for TCC lookups (client_type=1).
+#[allow(dead_code)]
+const DAEMON_BINARY_PATH: &str = "/Library/Application Support/ScreenControl/sc-agent";
+
+/// Query the system TCC database for a given service.
+/// Checks both the bundle ID (client_type=0) and the binary path (client_type=1),
+/// since macOS may register either depending on how the permission was granted.
 /// Returns true if auth_value == 2 (allowed).
 #[cfg(target_os = "macos")]
 fn check_tcc_for_daemon(service: &str) -> bool {
     use std::process::Command;
     // The system TCC database is at /Library/Application Support/com.apple.TCC/TCC.db
-    // We need root to read it, but the setup app runs after `sudo sc-agent install`
-    // so it may have inherited root. If not, fall back to process-local check.
+    // We need root to read it, which we have since setup runs via `sudo sc-agent install`.
+    //
+    // Query both:
+    //   - client_type=0 (bundle ID): used when permission is granted to an .app bundle
+    //   - client_type=1 (binary path): used when permission is granted to a command-line binary
     let output = Command::new("sqlite3")
         .args([
             "/Library/Application Support/com.apple.TCC/TCC.db",
             &format!(
-                "SELECT auth_value FROM access WHERE service='{}' AND client='{}' AND auth_value=2;",
-                service, DAEMON_BUNDLE_ID
+                "SELECT auth_value FROM access WHERE service='{}' AND ((client='{}' AND client_type=0) OR (client='{}' AND client_type=1)) AND auth_value=2 LIMIT 1;",
+                service, DAEMON_BUNDLE_ID, DAEMON_BINARY_PATH
             ),
         ])
         .output();
@@ -98,75 +263,75 @@ fn check_tcc_for_daemon(service: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn check_screen_recording() -> bool {
-    // First check the daemon's TCC entry directly
-    if check_tcc_for_daemon("kTCCServiceScreenCapture") {
+    // Primary: process-local check via CGPreflightScreenCaptureAccess.
+    // Since setup runs from the .app bundle (via `open ScreenControl.app`),
+    // this checks the bundle's own permissions — which IS the daemon identity.
+    let granted = unsafe { CGPreflightScreenCaptureAccess() };
+    if granted {
         return true;
     }
-    // Fall back to process-local check (less reliable for daemon)
-    unsafe { CGPreflightScreenCaptureAccess() }
+    // Fallback: TCC database query (works when running as root)
+    check_tcc_for_daemon("kTCCServiceScreenCapture")
 }
 
 #[cfg(target_os = "macos")]
 fn check_accessibility() -> bool {
-    // Check the daemon's TCC entry directly
-    if check_tcc_for_daemon("kTCCServiceAccessibility") {
+    // Primary: process-local check via AXIsProcessTrusted.
+    // Works correctly from the .app bundle context.
+    let granted = unsafe { AXIsProcessTrusted() };
+    if granted {
         return true;
     }
-    // Fall back to process-local check
-    unsafe { AXIsProcessTrusted() }
+    // Fallback: TCC database query (works when running as root)
+    check_tcc_for_daemon("kTCCServiceAccessibility")
 }
 
-/// Check microphone permission via AVFoundation.
-/// AVAuthorizationStatus: 0=notDetermined, 1=restricted, 2=denied, 3=authorized
+/// Check microphone permission for the daemon.
 #[cfg(target_os = "macos")]
 fn check_microphone() -> bool {
-    // Check TCC database for the daemon
-    if check_tcc_for_daemon("kTCCServiceMicrophone") {
-        return true;
-    }
-    // Fall back to osascript check for current process
-    use std::process::Command;
-    let output = Command::new("osascript")
-        .args(["-e", "use framework \"AVFoundation\"", "-e",
-            "set status to (current application's AVCaptureDevice's authorizationStatusForMediaType:(current application's AVMediaTypeAudio)) as integer",
-            "-e", "return status as text"])
+    // Primary: check AVFoundation authorization status via osascript.
+    // Returns "authorized" if microphone access is granted.
+    let output = std::process::Command::new("osascript")
+        .args([
+            "-e", "use framework \"AVFoundation\"",
+            "-e", "set authStatus to current application's AVCaptureDevice's authorizationStatusForMediaType:(current application's AVMediaTypeAudio)",
+            "-e", "if authStatus is 3 then return \"authorized\"",
+            "-e", "return \"denied\"",
+        ])
         .output();
-    match output {
-        Ok(out) => {
-            let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            status == "3" // 3 = authorized
+    if let Ok(out) = output {
+        let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if result == "authorized" {
+            return true;
         }
-        Err(_) => false,
     }
+    // Fallback: TCC database query
+    check_tcc_for_daemon("kTCCServiceMicrophone")
 }
 
-/// Check Full Disk Access by probing a TCC-protected path.
-/// Reading ~/Library/Application Support/com.apple.TCC/TCC.db requires FDA.
+/// Check Full Disk Access for the daemon.
 #[cfg(target_os = "macos")]
 fn check_full_disk_access() -> bool {
-    // Check TCC database entry for the daemon
-    if check_tcc_for_daemon("kTCCServiceSystemPolicyAllFiles") {
+    // Primary: try to read a TCC-protected path.
+    // Non-root processes can only read this if FDA is granted.
+    let can_read = std::fs::read_dir("/Library/Application Support/com.apple.TCC").is_ok();
+    if can_read {
         return true;
     }
-    // Fall back to probe
-    if let Some(home) = dirs::home_dir() {
-        let tcc_db = home.join("Library/Application Support/com.apple.TCC/TCC.db");
-        std::fs::File::open(&tcc_db).is_ok()
-    } else {
-        false
-    }
+    // Fallback: TCC database query
+    check_tcc_for_daemon("kTCCServiceSystemPolicyAllFiles")
 }
 
 // ── Verify daemon is installed & running ───────────────────────
 
 fn verify_agent_running() -> Result<(), String> {
-    // Check if the LaunchDaemon plist exists
-    let plist_path = "/Library/LaunchDaemons/com.screencontrol.agent.plist";
+    // Check if the LaunchAgent plist exists
+    let plist_path = "/Library/LaunchAgents/com.screencontrol.agent.plist";
     if !std::path::Path::new(plist_path).exists() {
-        return Err("LaunchDaemon not installed. Run 'sudo sc-agent install' first.".into());
+        return Err("Agent not installed. Run 'sudo sc-agent install' first.".into());
     }
 
-    // Check if the daemon is loaded
+    // Check if the agent is loaded
     let output = std::process::Command::new("launchctl")
         .args(["list"])
         .output()
@@ -176,16 +341,16 @@ fn verify_agent_running() -> Result<(), String> {
     if list_output.contains("com.screencontrol.agent") {
         Ok(())
     } else {
-        // Try to load it (might need sudo, but try anyway)
+        // Try to load it
         let status = std::process::Command::new("launchctl")
             .args(["load", "-w", plist_path])
             .status()
-            .map_err(|e| format!("Failed to load daemon: {}", e))?;
+            .map_err(|e| format!("Failed to load agent: {}", e))?;
 
         if status.success() {
             Ok(())
         } else {
-            Err("Daemon is installed but not running. Try: sudo launchctl load -w /Library/LaunchDaemons/com.screencontrol.agent.plist".into())
+            Err("Agent is installed but not running. Try: launchctl load -w /Library/LaunchAgents/com.screencontrol.agent.plist".into())
         }
     }
 }
@@ -275,7 +440,21 @@ pub fn run_setup() -> ! {
         *control_flow = ControlFlow::Wait;
 
         match event {
-            Event::UserEvent(SetupEvent::Ready) | Event::UserEvent(SetupEvent::CheckPermissions) => {
+            Event::UserEvent(SetupEvent::Ready) => {
+                // Just check current permission status — no prompts.
+                // Prompts are triggered when the user clicks each button.
+                let screen_ok = check_screen_recording();
+                let accessibility_ok = check_accessibility();
+                let mic_ok = check_microphone();
+                let fda_ok = check_full_disk_access();
+                let js = format!(
+                    "updatePermissions({}, {}, {}, {})",
+                    screen_ok, accessibility_ok, mic_ok, fda_ok
+                );
+                let _ = webview.evaluate_script(&js);
+            }
+
+            Event::UserEvent(SetupEvent::CheckPermissions) => {
                 let screen_ok = check_screen_recording();
                 let accessibility_ok = check_accessibility();
                 let mic_ok = check_microphone();
@@ -290,43 +469,30 @@ pub fn run_setup() -> ! {
             Event::UserEvent(SetupEvent::OpenSettings(category)) => {
                 #[cfg(target_os = "macos")]
                 {
+                    // Open the appropriate System Settings pane.
+                    // The install already pre-granted TCC entries via sqlite3 INSERT.
+                    // We just need the user to toggle/confirm in System Settings.
                     match category.as_str() {
                         "screen_recording" => {
-                            // Trigger the native Screen Recording consent dialog
-                            // This shows macOS's "X would like to record..." prompt
-                            unsafe { CGRequestScreenCaptureAccess(); }
-                            // Also open System Settings so the user can find ScreenControl
+                            // Trigger native Screen Recording prompt — adds ScreenControl to the list
+                            prompt_screen_recording();
                             let _ = std::process::Command::new("open")
                                 .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
                                 .spawn();
                         }
                         "accessibility" => {
-                            // Insert a TCC entry for the daemon's bundle ID to make it
-                            // appear in System Settings, then open the panel for the user
-                            let _ = std::process::Command::new("sqlite3")
-                                .args([
-                                    "/Library/Application Support/com.apple.TCC/TCC.db",
-                                    &format!(
-                                        "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, flags) VALUES ('kTCCServiceAccessibility', '{}', 0, 2, 0, 1, 0);",
-                                        DAEMON_BUNDLE_ID
-                                    ),
-                                ])
-                                .output();
+                            // Trigger native Accessibility prompt — adds ScreenControl to the list
+                            prompt_accessibility();
                             let _ = std::process::Command::new("open")
                                 .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
                                 .spawn();
                         }
                         "microphone" => {
-                            // Trigger the native microphone permission dialog.
-                            // The app must call requestAccess() to appear in the TCC panel.
-                            let _ = std::process::Command::new("osascript")
-                                .args([
-                                    "-e", "use framework \"AVFoundation\"",
-                                    "-e", "current application's AVCaptureDevice's requestAccessForMediaType:(current application's AVMediaTypeAudio) completionHandler:(missing value)",
-                                ])
-                                .spawn();
+                            // Trigger native Microphone prompt — shows the system dialog
+                            prompt_microphone();
                         }
                         "full_disk_access" => {
+                            // No native API — just open System Settings
                             let _ = std::process::Command::new("open")
                                 .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
                                 .spawn();
@@ -336,13 +502,33 @@ pub fn run_setup() -> ! {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = category; // suppress unused warning
+                    let _ = category;
                     tracing::info!("Open settings not supported on this platform");
                 }
-
             }
 
             Event::UserEvent(SetupEvent::StartAgent) => {
+                // Restart the agent so it picks up newly granted TCC permissions.
+                // macOS (especially Sequoia) requires app restart for Screen Recording.
+                #[cfg(target_os = "macos")]
+                {
+                    // Get console user UID for gui/ domain
+                    let uid = std::process::Command::new("stat")
+                        .args(["-f", "%u", "/dev/console"])
+                        .output()
+                        .ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|| "501".to_string());
+                    let target = format!("gui/{}/com.screencontrol.agent", uid);
+                    let _ = std::process::Command::new("launchctl")
+                        .args(["kickstart", "-kp", &target])
+                        .output();
+                }
+
+                // Give the daemon a moment to restart before checking
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+
                 let result = verify_agent_running();
                 let js = match &result {
                     Ok(()) => "agentStarted(true, '')".to_string(),
